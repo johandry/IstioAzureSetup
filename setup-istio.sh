@@ -1,0 +1,1260 @@
+#!/bin/bash
+
+# Enhanced Azure AKS + Istio Setup Script with Full Parameter Support
+# This script provides comprehensive management for AKS, Istio, and VM mesh integration
+# The script is idempotent and can be run multiple times safely
+
+# Enable error handling but allow some commands to fail gracefully
+set -e
+
+# Configuration variables
+LOCATION="westus"
+CLUSTER_NAME="istio-aks-cluster"
+NODE_COUNT=3
+NODE_VM_SIZE="Standard_L8s_v3"
+CLUSTER_NETWORK="kube-network" # Multi-Network
+VM_SIZE="Standard_B2s"
+
+# Shared configuration variables
+RESOURCE_GROUP="istio-playground-rg"
+VM_NAME="istio-vm"
+
+# Local workspace directories (keep everything in current directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$SCRIPT_DIR/workspace"
+ISTIO_DIR="$WORKSPACE_DIR/istio-installation"
+VM_MESH_DIR="$WORKSPACE_DIR/vm-mesh-setup"
+CERTS_DIR="$WORKSPACE_DIR/certs"
+CONFIGS_DIR="$WORKSPACE_DIR/configs"
+SCRIPTS_DIR="$SCRIPT_DIR/scripts"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YIGHLIGHT}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+print_header() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================${NC}"
+}
+
+show_usage() {
+    echo "Azure AKS + Istio Management Script"
+    echo ""
+    echo "Usage: $0 [COMMAND] [OPTIONS]"
+    echo ""
+    echo "COMMANDS:"
+    echo "  setup              Complete AKS and Istio setup (default)"
+    echo "  setup-vm-mesh      Setup VM mesh integration"
+    echo "  deploy-samples     Deploy Istio sample applications"
+    echo "  deploy-mesh-test   Deploy mesh testing applications"
+    echo "  test-mesh          Test VM mesh integration"
+    echo "  status             Show current deployment status"
+    echo "  cleanup            Clean up all Azure resources"
+    echo "  cleanup-local      Clean up local workspace only"
+    echo "  help               Show this help message"
+    echo ""
+    echo "OPTIONS:"
+    echo "  --resource-group NAME    Override resource group name"
+    echo "  --cluster-name NAME      Override cluster name"
+    echo "  --vm-name NAME          Override VM name"
+    echo "  --location LOCATION     Override Azure location"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  $0                      # Complete setup"
+    echo "  $0 setup               # Complete setup"
+    echo "  $0 setup-vm-mesh       # Setup VM mesh only"
+    echo "  $0 deploy-samples      # Deploy sample apps"
+    echo "  $0 status              # Check status"
+    echo "  $0 cleanup             # Clean everything"
+    echo ""
+}
+
+# Parse command line arguments
+parse_arguments() {
+    COMMAND="setup"  # Default command
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            setup|setup-vm-mesh|deploy-samples|deploy-mesh-test|test-mesh|status|cleanup|cleanup-local|help)
+                COMMAND="$1"
+                ;;
+            --resource-group)
+                RESOURCE_GROUP="$2"
+                shift
+                ;;
+            --cluster-name)
+                CLUSTER_NAME="$2"
+                shift
+                ;;
+            --vm-name)
+                VM_NAME="$2"
+                shift
+                ;;
+            --location)
+                LOCATION="$2"
+                shift
+                ;;
+            -h|--help)
+                COMMAND="help"
+                ;;
+            *)
+                print_error "Unknown parameter: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# Show comprehensive status
+show_status() {
+    print_header "AZURE ISTIO DEPLOYMENT STATUS"
+    
+    echo ""
+    echo "Configuration:"
+    echo "  Resource Group: $RESOURCE_GROUP"
+    echo "  Cluster Name: $CLUSTER_NAME"
+    echo "  VM Name: $VM_NAME"
+    echo "  Location: $LOCATION"
+    echo "  Workspace: $WORKSPACE_DIR"
+    echo ""
+    
+    # Check Azure resources
+    echo "Azure Resources:"
+    if az group show --name $RESOURCE_GROUP &> /dev/null; then
+        echo "  ✓ Resource Group: $RESOURCE_GROUP exists"
+    else
+        echo "  ✗ Resource Group: $RESOURCE_GROUP does not exist"
+    fi
+    
+    if az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME &> /dev/null; then
+        CLUSTER_STATE=$(az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --query "powerState.code" -o tsv)
+        echo "  ✓ AKS Cluster: $CLUSTER_NAME ($CLUSTER_STATE)"
+    else
+        echo "  ✗ AKS Cluster: $CLUSTER_NAME does not exist"
+    fi
+    
+    if az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null; then
+        VM_STATE=$(az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME --show-details --query "powerState" -o tsv)
+        VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+        echo "  ✓ VM: $VM_NAME ($VM_STATE) - IP: $VM_IP"
+    else
+        echo "  ✗ VM: $VM_NAME does not exist"
+    fi
+    
+    echo ""
+    
+    # Check Kubernetes resources
+    echo "Kubernetes Resources:"
+    if kubectl get namespace istio-system &> /dev/null 2>&1; then
+        echo "  ✓ Istio namespace exists"
+        
+        if kubectl get deployment istiod -n istio-system &> /dev/null 2>&1; then
+            ISTIOD_STATUS=$(kubectl get deployment istiod -n istio-system -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null)
+            echo "  ✓ Istiod deployment: $ISTIOD_STATUS ready"
+        else
+            echo "  ✗ Istiod deployment not found"
+        fi
+        
+        GATEWAY_IP=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "Not assigned")
+        echo "  ✓ Ingress Gateway IP: $GATEWAY_IP"
+    else
+        echo "  ✗ Istio not installed"
+    fi
+    
+    # Check VM mesh resources
+    if kubectl get namespace vm-workloads &> /dev/null 2>&1; then
+        echo "  ✓ VM workloads namespace exists"
+        
+        WORKLOAD_ENTRIES=$(kubectl get workloadentry -n vm-workloads --no-headers 2>/dev/null | wc -l)
+        echo "  ✓ WorkloadEntries: $WORKLOAD_ENTRIES"
+        
+        VM_SERVICES=$(kubectl get svc -n vm-workloads --no-headers 2>/dev/null | wc -l)
+        echo "  ✓ VM Services: $VM_SERVICES"
+    else
+        echo "  ✗ VM workloads namespace not found"
+    fi
+    
+    echo ""
+}
+
+# Create local workspace structure
+create_local_workspace() {
+    print_status "Creating local workspace structure..."
+    
+    # Create all necessary directories in the current workspace
+    mkdir -p "$WORKSPACE_DIR"
+    mkdir -p "$ISTIO_DIR"
+    mkdir -p "$VM_MESH_DIR"
+    mkdir -p "$CERTS_DIR"
+    mkdir -p "$CONFIGS_DIR"
+    mkdir -p "$VM_MESH_DIR/vm-files"
+    mkdir -p "$VM_MESH_DIR/cluster-configs"
+    mkdir -p "$VM_MESH_DIR/certificates"
+    
+    # Create symlinks if needed for system tools
+    if [ ! -L "/tmp/vm-mesh-setup" ]; then
+        ln -sf "$VM_MESH_DIR" "/tmp/vm-mesh-setup" 2>/dev/null || print_warning "Could not create symlink to /tmp"
+    fi
+    
+    print_status "Workspace created at: $WORKSPACE_DIR"
+}
+
+# Check prerequisites
+check_prerequisites() {
+    print_status "Checking prerequisites..."
+    
+    if ! command -v az &> /dev/null; then
+        print_error "Azure CLI is not installed. Please install it first."
+        exit 1
+    fi
+    
+    if ! command -v kubectl &> /dev/null; then
+        print_error "kubectl is not installed. Please install it first."
+        exit 1
+    fi
+    
+    check_azure_login
+   
+    print_status "Prerequisites check passed!"
+}
+
+# Check existing Azure resources to avoid conflicts
+check_existing_resources() {
+    print_status "Checking existing Azure resources..."
+    
+    # Get current subscription info
+    SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+    SUBSCRIPTION_NAME=$(az account show --query name -o tsv)
+    
+    print_status "Using Azure subscription: $SUBSCRIPTION_NAME ($SUBSCRIPTION_ID)"
+    
+    # Check resource group existence
+    if az group show --name $RESOURCE_GROUP &> /dev/null; then
+        print_status "Resource group '$RESOURCE_GROUP' exists"
+        
+        # Check for existing AKS cluster
+        if az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME &> /dev/null; then
+            CLUSTER_STATE=$(az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --query "powerState.code" -o tsv)
+            print_status "AKS cluster '$CLUSTER_NAME' exists (State: $CLUSTER_STATE)"
+            
+            # If cluster exists but is stopped, we'll start it later
+            if [ "$CLUSTER_STATE" != "Running" ]; then
+                print_warning "Cluster is not running - will be started during setup"
+            fi
+        else
+            print_status "AKS cluster '$CLUSTER_NAME' does not exist - will be created"
+        fi
+        
+        # Check for existing VM
+        if az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null; then
+            VM_STATE=$(az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME --show-details --query "powerState" -o tsv)
+            print_status "VM '$VM_NAME' exists (State: $VM_STATE)"
+            
+            # If VM exists but is stopped, we'll start it later
+            if [ "$VM_STATE" != "VM running" ]; then
+                print_warning "VM is not running - will be started during setup"
+            fi
+        else
+            print_status "VM '$VM_NAME' does not exist - will be created"
+        fi
+    else
+        print_status "Resource group '$RESOURCE_GROUP' does not exist - will be created"
+    fi
+    
+    # Validate Azure location
+    if ! az account list-locations --query "[?name=='$LOCATION']" -o tsv | grep -q "$LOCATION"; then
+        print_error "Invalid Azure location: $LOCATION"
+        print_status "Available locations:"
+        az account list-locations --query "[].name" -o tsv | sort
+        exit 1
+    fi
+    
+    print_status "✓ Resource validation completed"
+}
+
+# Create resource group
+create_resource_group() {
+    print_status "Creating resource group: $RESOURCE_GROUP"
+    
+    if az group show --name $RESOURCE_GROUP &> /dev/null; then
+        print_status "Resource group $RESOURCE_GROUP already exists, skipping creation"
+    else
+        az group create --name $RESOURCE_GROUP --location $LOCATION
+        print_status "Resource group $RESOURCE_GROUP created successfully"
+    fi
+}
+
+# Create AKS cluster
+create_aks_cluster() {
+    print_status "Creating AKS cluster: $CLUSTER_NAME"
+    
+    if az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME &> /dev/null; then
+        print_status "AKS cluster $CLUSTER_NAME already exists, skipping creation"
+        
+        # Check if cluster is running
+        CLUSTER_STATE=$(az aks show --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --query "powerState.code" -o tsv)
+        if [ "$CLUSTER_STATE" != "Running" ]; then
+            print_warning "Cluster exists but is not running. State: $CLUSTER_STATE"
+            print_status "Starting cluster..."
+            az aks start --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME
+        fi
+    else
+        print_warning "This may take 10-15 minutes..."
+        az aks create \
+            --resource-group $RESOURCE_GROUP \
+            --name $CLUSTER_NAME \
+            --node-count $NODE_COUNT \
+            --node-vm-size $NODE_VM_SIZE \
+            --enable-addons monitoring \
+            --generate-ssh-keys \
+            --enable-managed-identity \
+            --network-plugin azure \
+            --service-cidr 10.0.0.0/16 \
+            --dns-service-ip 10.0.0.10 \
+            --tier free
+        print_status "AKS cluster $CLUSTER_NAME created successfully"
+    fi
+}
+
+# Get AKS credentials
+get_aks_credentials() {
+    print_status "Getting AKS credentials..."
+    
+    # Always get credentials to ensure they're current
+    az aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --overwrite-existing
+    
+    # Verify connection
+    if kubectl cluster-info &> /dev/null; then
+        print_status "Successfully connected to cluster"
+    else
+        print_error "Failed to connect to cluster"
+        exit 1
+    fi
+}
+
+# Create VM
+create_vm() {
+    print_status "Creating VM: $VM_NAME"
+    
+    if az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null; then
+        print_status "VM $VM_NAME already exists, skipping creation"
+        
+        # Check if VM is running
+        VM_STATE=$(az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME  --show-details --query "powerState" -o tsv)
+        if [ "$VM_STATE" != "VM running" ]; then
+            print_warning "VM exists but is not running. State: $VM_STATE"
+            print_status "Starting VM..."
+            az vm start --resource-group $RESOURCE_GROUP --name $VM_NAME
+        fi
+    else
+        az vm create \
+            --resource-group $RESOURCE_GROUP \
+            --name $VM_NAME \
+            --image Ubuntu2204 \
+            --size $VM_SIZE \
+            --admin-username azureuser \
+            --generate-ssh-keys \
+            --public-ip-sku Standard 
+        print_status "VM $VM_NAME created successfully"
+    fi
+    
+    # Ensure SSH port is open (idempotent operation)
+    az vm open-port --port 22 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
+
+    # Open application ports for access (idempotent)
+    az vm open-port --port 8080 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
+    az vm open-port --port 443  --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
+    az vm open-port --port 15000-15090 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
+    print_status "Application ports (8080, 443, 15000-15090) opened on VM"
+}
+
+# Install Istio on the cluster
+install_istio() {
+    print_status "Installing Istio on AKS cluster..."
+    
+    # Check if Istio is already installed
+    if kubectl get namespace istio-system &> /dev/null && kubectl get deployment istiod -n istio-system &> /dev/null; then
+        print_status "Istio is already installed, checking status..."
+        
+        # Check if istiod is ready
+        local ready_replicas=$(kubectl get deployment istiod -n istio-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        local desired_replicas=$(kubectl get deployment istiod -n istio-system -o jsonpath='{.status.replicas}' 2>/dev/null || echo "1")
+        
+        if [ "$ready_replicas" -ge "1" ] && [ "$ready_replicas" = "$desired_replicas" ]; then
+            print_status "Istio is installed and ready ($ready_replicas/$desired_replicas replicas)"
+        else
+            print_warning "Istio is installed but not ready ($ready_replicas/$desired_replicas replicas), waiting..."
+            kubectl wait --for=condition=available --timeout=300s deployment/istiod -n istio-system
+        fi
+    else
+        # Download Istio to local workspace
+        if [ ! -d "$ISTIO_DIR" ] || [ ! -f "$ISTIO_DIR/bin/istioctl" ]; then
+            print_status "Downloading Istio to workspace directory..."
+            
+            # Ensure workspace directory exists
+            mkdir -p "$WORKSPACE_DIR"
+            cd "$WORKSPACE_DIR"
+            
+            # Download latest Istio
+            curl -L https://istio.io/downloadIstio | sh -
+            
+            # Move to our organized structure and preserve samples
+            local istio_download_dir=$(find . -maxdepth 1 -name "istio-*" -type d | head -1)
+            
+            if [ -n "$istio_download_dir" ] && [ -d "$istio_download_dir" ]; then
+                print_status "Found Istio download directory: $istio_download_dir"
+                
+                # Remove old installation if it exists
+                if [ -d "istio-installation" ]; then
+                    print_status "Removing existing Istio installation..."
+                    rm -rf istio-installation
+                fi
+                
+                # Move the downloaded directory to our standard name
+                mv "$istio_download_dir" istio-installation
+                
+                print_status "Istio downloaded to: $ISTIO_DIR"
+            else
+                print_error "Failed to find Istio download directory"
+                exit 1
+            fi
+            
+            cd "$SCRIPT_DIR"
+        else
+            print_status "Istio already exists in workspace at: $ISTIO_DIR"
+        fi
+        
+        # Add istioctl to PATH for this session
+        export PATH="$ISTIO_DIR/bin:$PATH"
+        
+        # Verify istioctl is working
+        if ! command -v istioctl &> /dev/null; then
+            print_error "istioctl not found in PATH after download"
+            print_status "Expected location: $ISTIO_DIR/bin/istioctl"
+            print_status "Current PATH: $PATH"
+            if [ -f "$ISTIO_DIR/bin/istioctl" ]; then
+                print_status "istioctl file exists, checking permissions..."
+                ls -la "$ISTIO_DIR/bin/istioctl"
+            fi
+            exit 1
+        fi
+        
+        print_status "Using istioctl from: $(which istioctl)"
+        
+        # Get Istio version for logging
+        local istio_version=$(istioctl version 2>/dev/null | grep "client version" | cut -d':' -f2 | tr -d ' ' || echo "unknown")
+        print_status "Installing Istio version: $istio_version"
+
+        # Install Istio with demo profile to avoid installing CRDs or other components
+        print_status "Installing Istio with demo profile..."
+        cat <<EOF | istioctl install -y -f -
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio
+  namespace: istio-system
+spec:
+  profile: demo
+  values:
+    global:
+      meshID: mesh1
+      multiCluster:
+        clusterName: "${CLUSTER_NAME}"
+      network: "${CLUSTER_NETWORK}"
+EOF
+
+        print_status "Deploy the east-west (internal) gateway..."
+        cat <<EOF | istioctl install -y -f -
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: eastwest
+spec:
+  revision: ""
+  profile: empty
+  components:
+    ingressGateways:
+      - name: istio-eastwestgateway
+        label:
+          istio: eastwestgateway
+          app: istio-eastwestgateway
+          topology.istio.io/network: "${CLUSTER_NETWORK}"
+        enabled: true
+        k8s:
+          env:
+            # traffic through this gateway should be routed inside the network
+            - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+              value: "${CLUSTER_NETWORK}"
+          service:
+            ports:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+              - name: tls
+                port: 15443
+                targetPort: 15443
+              - name: tls-istiod
+                port: 15012
+                targetPort: 15012
+              - name: tls-webhook
+                port: 15017
+                targetPort: 15017
+  values:
+    gateways:
+      istio-ingressgateway:
+        injectionTemplate: gateway
+    global:
+      network: "${CLUSTER_NETWORK}"
+EOF
+
+        print_status "Exposing the control plane..."
+        # From samples/multicluster/expose-istiod.yaml
+        kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: istiod-gateway
+spec:
+  selector:
+    istio: eastwestgateway
+  servers:
+    - port:
+        name: tls-istiod
+        number: 15012
+        protocol: tls
+      tls:
+        mode: PASSTHROUGH        
+      hosts:
+        - "*"
+    - port:
+        name: tls-istiodwebhook
+        number: 15017
+        protocol: tls
+      tls:
+        mode: PASSTHROUGH          
+      hosts:
+        - "*"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: istiod-vs
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - istiod-gateway
+  tls:
+  - match:
+    - port: 15012
+      sniHosts:
+      - "*"
+    route:
+    - destination:
+        host: istiod.istio-system.svc.cluster.local
+        port:
+          number: 15012
+  - match:
+    - port: 15017
+      sniHosts:
+      - "*"
+    route:
+    - destination:
+        host: istiod.istio-system.svc.cluster.local
+        port:
+          number: 443
+EOF
+
+  
+        print_status "Exposing cluster services..."
+        # From samples/multicluster/expose-services.yaml
+        kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: cross-network-gateway
+spec:
+  selector:
+    istio: eastwestgateway
+  servers:
+    - port:
+        number: 15443
+        name: tls
+        protocol: TLS
+      tls:
+        mode: AUTO_PASSTHROUGH
+      hosts:
+        - "*.local"
+EOF
+
+        # label the istio-system namespace with the cluster network
+        kubectl label namespace istio-system topology.istio.io/network="${CLUSTER_NETWORK}"
+        
+        print_status "Waiting for Istio components to be ready..."
+        kubectl wait --for=condition=available --timeout=300s deployment/istiod -n istio-system
+        
+        print_status "Istio installed successfully on AKS cluster"
+    fi
+    
+    # Label default namespace for Istio injection (idempotent)
+    kubectl label namespace default istio-injection=enabled --overwrite
+    
+    # Install Istio addons from workspace samples directory
+    if [ -d "$ISTIO_DIR/samples/addons" ]; then
+        print_status "Installing Istio addons from workspace samples..."
+        
+        # Apply addons with error handling
+        for addon in "$ISTIO_DIR/samples/addons"/*.yaml; do
+            if [ -f "$addon" ]; then
+                local addon_name=$(basename "$addon" .yaml)
+                print_status "Installing addon: $addon_name"
+                kubectl apply -f "$addon" || print_warning "Failed to install $addon_name addon"
+            fi
+        done
+        
+        # Wait for addon deployments to be ready with timeout handling
+        print_status "Waiting for addon deployments to be ready..."
+        
+        # Check each addon separately to avoid timeout issues
+        if kubectl get deployment kiali -n istio-system &> /dev/null; then
+            kubectl wait --for=condition=available --timeout=180s deployment/kiali -n istio-system || print_warning "Kiali not ready within timeout"
+        fi
+        
+        if kubectl get deployment grafana -n istio-system &> /dev/null; then
+            kubectl wait --for=condition=available --timeout=180s deployment/grafana -n istio-system || print_warning "Grafana not ready within timeout"
+        fi
+        
+        if kubectl get deployment jaeger -n istio-system &> /dev/null; then
+            kubectl wait --for=condition=available --timeout=180s deployment/jaeger -n istio-system || print_warning "Jaeger not ready within timeout"
+        fi
+        
+        print_status "Istio addons installed from workspace samples"
+    else
+        print_warning "Addons directory not found: $ISTIO_DIR/samples/addons"
+    fi
+}
+
+# Deploy HelloWorld sample application with Azure optimized gateway
+deploy_helloworld_sample() {
+    print_header "DEPLOYING HELLOWORLD SAMPLE APPLICATION"
+    
+
+    print_status "Deploying HelloWorld from Istio samples..."
+    kubectl apply -f "$ISTIO_DIR/samples/helloworld/helloworld.yaml"
+
+    
+    # Wait for deployments to be ready
+    print_status "Waiting for HelloWorld deployments to be ready..."
+    kubectl wait --for=condition=available --timeout=300s deployment/helloworld-v1 || print_warning "HelloWorld-v1 not ready within timeout"
+    kubectl wait --for=condition=available --timeout=300s deployment/helloworld-v2 || print_warning "HelloWorld-v2 not ready within timeout"
+    
+    # Create Gateway and VirtualService for HelloWorld
+    print_status "Configuring HelloWorld gateway and routing..."
+    kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: helloworld-gateway
+  namespace: default
+  labels:
+    app: helloworld
+    environment: development
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: helloworld
+  namespace: default
+  labels:
+    app: helloworld
+    environment: development
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - helloworld-gateway
+  - istio-system/istio-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /hello
+    route:
+    - destination:
+        host: helloworld.default.svc.cluster.local
+        port:
+          number: 5000
+    timeout: 30s
+    retries:
+      attempts: 3
+      perTryTimeout: 10s
+  - match:
+    - uri:
+        exact: /
+    redirect:
+      uri: /hello
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: helloworld
+  namespace: default
+  labels:
+    app: helloworld
+spec:
+  host: helloworld.default.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 10
+      http:
+        http1MaxPendingRequests: 10
+        maxRequestsPerConnection: 2
+    loadBalancer:
+      simple: ROUND_ROBIN
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 30s
+      baseEjectionTime: 30s
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+EOF
+    
+    print_status "✅ HelloWorld sample application deployed successfully!"
+    
+    # Show access information
+    local gateway_ip=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+    if [ "$gateway_ip" != "pending" ] && [ -n "$gateway_ip" ]; then
+        print_status "🌐 Access HelloWorld at: http://$gateway_ip/hello"
+        print_status "🔄 Refresh the page multiple times to see traffic distribution between v1 and v2"
+    else
+        print_status "⏳ Gateway IP assignment pending. Check status with: kubectl get svc istio-ingressgateway -n istio-system"
+    fi
+}
+
+# Create TLS certificate for HTTPS (store in local certs directory)
+setup_tls_certificate() {
+    print_status "Setting up TLS certificate for gateway..."
+    
+    if kubectl get secret istio-tls-secret -n istio-system &> /dev/null; then
+        print_status "TLS certificate already exists"
+        return 0
+    fi
+    
+    # Generate certificates in local certs directory
+    CERT_FILE="$CERTS_DIR/istio-gateway.crt"
+    KEY_FILE="$CERTS_DIR/istio-gateway.key"
+    
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+        print_status "Generating TLS certificates in local workspace..."
+        
+        # Create self-signed certificate for development
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -subj "/CN=istio-gateway.local/O=istio-gateway" \
+            -keyout "$KEY_FILE" \
+            -out "$CERT_FILE"
+        
+        print_status "Certificates generated in: $CERTS_DIR"
+    fi
+    
+    # Create Kubernetes secret from local files
+    kubectl create secret tls istio-tls-secret \
+        --cert="$CERT_FILE" \
+        --key="$KEY_FILE" \
+        -n istio-system 2>/dev/null || print_warning "TLS secret creation failed, HTTPS will not work"
+    
+    print_status "TLS certificate configured from local files"
+}
+
+# Configure VM for Istio mesh integration (not as bastion)
+configure_vm() {
+    print_status "Configuring VM for Istio mesh integration..."
+    
+    VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+    
+    if [ -z "$VM_IP" ]; then
+        print_error "Could not get VM IP address"
+        return 1
+    fi
+    
+    print_status "VM IP: $VM_IP"
+    
+    # Store VM IP in local config for reference
+    echo "VM_IP=$VM_IP" > "$CONFIGS_DIR/vm-config.env"
+    echo "VM_NAME=$VM_NAME" >> "$CONFIGS_DIR/vm-config.env"
+    echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> "$CONFIGS_DIR/vm-config.env"
+    
+    # Install basic packages on VM for mesh integration
+    print_status "Installing basic packages on VM..."
+    ssh -o StrictHostKeyChecking=no azureuser@$VM_IP 'sudo apt update && sudo apt install -y curl python3 python3-pip'
+    
+    # Install kubectl
+    stable_version=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+    print_status "Installing kubectl..."
+    ssh -o StrictHostKeyChecking=no azureuser@$VM_IP "curl -LO \"https://dl.k8s.io/release/$stable_version/bin/linux/amd64/kubectl\" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/"
+    kubectl_version=$(ssh -o StrictHostKeyChecking=no azureuser@$VM_IP "kubectl version | grep 'Client Version' | awk '{print \$3}'")
+    if [ "$kubectl_version" != "$stable_version" ]; then
+        print_warning "kubectl version mismatch: expected $stable_version, got $kubectl_version"
+    else
+        print_status "kubectl $kubectl_version installed successfully"
+    fi
+
+    # Install istioctl
+    print_status "Installing istioctl..."
+    ssh -o StrictHostKeyChecking=no azureuser@$VM_IP "curl -L https://istio.io/downloadIstio | sh - && sudo mv istio-*/bin/istioctl /usr/local/bin/ && rm -rf istio-*"
+    istioctl_version=$(ssh -o StrictHostKeyChecking=no azureuser@$VM_IP "istioctl version | grep 'client version' | awk '{print \$3}'")
+    if [ -z "$istioctl_version" ]; then
+        print_warning "istioctl version not found"
+    else
+        print_status "istioctl v$istioctl_version installed successfully"
+    fi
+
+    print_status "VM configured for mesh integration"
+}
+
+# Test HelloWorld connectivity and traffic distribution
+test_helloworld_connectivity() {
+    print_status "Testing HelloWorld connectivity and traffic distribution..."
+    
+    local gateway_ip=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+    
+    if [ -z "$gateway_ip" ]; then
+        print_warning "Gateway IP not available yet. Skipping connectivity test."
+        return 0
+    fi
+    
+    print_status "Gateway IP: $gateway_ip"
+    print_status "Testing HelloWorld service (5 requests)..."
+    
+    local v1_count=0
+    local v2_count=0
+    local failed_count=0
+    
+    for i in {1..5}; do
+        local response=$(curl -s --connect-timeout 5 --max-time 10 "http://$gateway_ip/hello" 2>/dev/null)
+        
+        if [ -n "$response" ]; then
+            if echo "$response" | grep -q "v1"; then
+                v1_count=$((v1_count + 1))
+                echo "  Request $i: v1 ✓"
+            elif echo "$response" | grep -q "v2"; then
+                v2_count=$((v2_count + 1))
+                echo "  Request $i: v2 ✓"
+            else
+                echo "  Request $i: Unknown response"
+                failed_count=$((failed_count + 1))
+            fi
+        else
+            echo "  Request $i: Failed ✗"
+            failed_count=$((failed_count + 1))
+        fi
+        
+        sleep 1
+    done
+    
+    echo ""
+    print_status "Traffic Distribution Results:"
+    echo "  HelloWorld v1: $v1_count requests"
+    echo "  HelloWorld v2: $v2_count requests"
+    echo "  Failed: $failed_count requests"
+    
+    if [ $failed_count -eq 0 ]; then
+        print_status "✅ All connectivity tests passed!"
+        if [ $v1_count -gt 0 ] && [ $v2_count -gt 0 ]; then
+            print_status "✅ Traffic distribution working correctly between versions"
+        fi
+    else
+        print_warning "Some connectivity tests failed. This may be normal during initial deployment."
+    fi
+}
+
+# Enhanced connection info with local workspace details
+get_connection_info() {
+    print_status "Getting connection information..."
+    
+    # Load VM config from local file
+    if [ -f "$CONFIGS_DIR/vm-config.env" ]; then
+        source "$CONFIGS_DIR/vm-config.env"
+    else
+        VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv)
+    fi
+    
+    # Load Azure config
+    if [ -f "$CONFIGS_DIR/azure-config.env" ]; then
+        source "$CONFIGS_DIR/azure-config.env"
+    fi
+    
+    GATEWAY_IP=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "Not assigned")
+    GATEWAY_FQDN=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Not assigned")
+    
+    echo ""
+    echo "========================================="
+    echo "SETUP COMPLETED SUCCESSFULLY!"
+    echo "========================================="
+    echo ""
+    echo "🎉 HelloWorld Sample Application Ready!"
+    echo ""
+    echo "Quick Test Commands:"
+    if [ "$GATEWAY_IP" != "Not assigned" ]; then
+        echo "  curl http://$GATEWAY_IP/hello                    # Test HelloWorld"
+        echo "  for i in {1..10}; do curl http://$GATEWAY_IP/hello; echo; done  # Test load balancing"
+    fi
+    echo ""
+    echo "Local Workspace: $WORKSPACE_DIR"
+    echo "  ├── istio-installation/    # Istio binaries, samples, and documentation"
+    echo "  │   ├── bin/              # istioctl and other tools"
+    echo "  │   ├── samples/          # Istio sample applications and configurations"
+    echo "  │   └── manifests/        # Istio installation manifests"
+    echo "  ├── vm-mesh-setup/         # VM mesh integration files"
+    echo "  ├── certs/                 # TLS certificates"
+    echo "  └── configs/               # Configuration files"
+    echo ""
+    echo "Azure Resources:"
+    echo "  AKS Cluster: $CLUSTER_NAME"
+    echo "  Resource Group: $RESOURCE_GROUP"
+    echo "  VM IP: $VM_IP"
+    echo "  Gateway IP: $GATEWAY_IP"
+    if [ "$GATEWAY_FQDN" != "Not assigned" ]; then
+        echo "  Gateway FQDN: $GATEWAY_FQDN"
+    fi
+    echo ""
+    echo "Sample Applications Access:"
+    if [ "$GATEWAY_IP" != "Not assigned" ]; then
+        echo "  🌍 HelloWorld App:      http://$GATEWAY_IP/hello"
+        echo "  📊 Kiali Dashboard:     http://$GATEWAY_IP/kiali"
+        echo "  📈 Grafana Dashboard:   http://$GATEWAY_IP/grafana"
+        echo "  🔍 Jaeger Tracing:      http://$GATEWAY_IP/jaeger"
+        echo "  🖥️  VM Service:          http://$GATEWAY_IP/vm-service"
+        echo "  ❤️  Gateway Health:      http://$GATEWAY_IP/health"
+    else
+        echo "  ⏳ Gateway IP pending assignment..."
+        echo "  📊 Port-forward Kiali:   kubectl port-forward -n istio-system svc/kiali 20001:20001"
+        echo "  📈 Port-forward Grafana: kubectl port-forward -n istio-system svc/grafana 3000:3000"
+        echo "  🔍 Port-forward Jaeger:  kubectl port-forward -n istio-system svc/jaeger 16686:16686"
+    fi
+    echo ""
+    echo "Configuration Files:"
+    echo "  VM Config: $CONFIGS_DIR/vm-config.env"
+    echo "  Azure Config: $CONFIGS_DIR/azure-config.env"
+    echo "  TLS Certs: $CERTS_DIR/"
+    echo "  Mesh Setup: $VM_MESH_DIR/"
+    echo ""
+    echo "VM Access:"
+    echo "  ssh azureuser@$VM_IP"
+    echo ""
+    echo "Local Tools:"
+    echo "  Istioctl: $ISTIO_DIR/bin/istioctl"
+    echo "  Add to PATH: export PATH=\"$ISTIO_DIR/bin:\$PATH\""
+    echo "  Sample Apps: ls -la $ISTIO_DIR/samples/"
+    echo ""
+    echo "Next Steps:"
+    echo "  1. Test HelloWorld: curl http://$GATEWAY_IP/hello"
+    echo "  2. View Kiali dashboard for service mesh topology"
+    echo "  3. Deploy additional sample applications: ./setup-istio.sh deploy-samples"
+    echo "  4. Set up VM mesh integration: ./setup-istio.sh setup-vm-mesh"
+    echo "  5. Test mesh integration: ./setup-istio.sh deploy-mesh-test"
+    echo "     then: ./setup-istio.sh test-mesh"
+    echo "  6. Clean up resources when done: ./setup-istio.sh cleanup-azure"
+    echo "     then optionally: ./setup-istio.sh cleanup-local"
+    echo ""
+}
+
+# Complete setup (updated to include HelloWorld)
+complete_setup() {
+    print_header "COMPLETE AZURE AKS + ISTIO SETUP WITH HELLOWORLD"
+    
+    create_local_workspace
+    check_prerequisites
+    check_existing_resources
+    create_resource_group
+    create_aks_cluster
+    get_aks_credentials
+    create_vm
+    install_istio
+    deploy_helloworld_sample
+    setup_tls_certificate # TODO: this may not be required
+    configure_vm
+    # test_helloworld_connectivity
+    get_connection_info
+    
+    print_status "✅ Complete setup with HelloWorld sample finished successfully!"
+}
+
+# Setup VM mesh integration
+setup_vm_mesh_integration() {
+    print_header "SETTING UP VM MESH INTEGRATION"
+    
+    if [ ! -f "$SCRIPTS_DIR/vm-mesh-integration.sh" ]; then
+        print_error "vm-mesh-integration.sh not found in scripts directory"
+        return 1
+    fi
+       
+    # Run the VM mesh integration script
+    cd "$SCRIPTS_DIR"
+    if bash vm-mesh-integration.sh; then
+        print_status "✅ VM mesh integration completed successfully"
+    else
+        print_error "VM mesh integration failed"
+        return 1
+    fi
+    
+    cd "$SCRIPT_DIR"
+}
+
+# Deploy sample applications
+deploy_samples() {
+    print_header "DEPLOYING ISTIO SAMPLE APPLICATIONS"
+    
+    if [ ! -f "$SCRIPTS_DIR/deploy-samples.sh" ]; then
+        print_error "deploy-samples.sh not found in scripts directory"
+        return 1
+    fi
+    
+    cd "$SCRIPTS_DIR"
+    if bash deploy-samples.sh --all; then
+        print_status "✅ Sample applications deployed successfully"
+    else
+        print_error "Sample applications deployment failed"
+        return 1
+    fi
+    
+    cd "$SCRIPT_DIR"
+}
+
+# Deploy mesh testing applications
+deploy_mesh_testing() { 
+    cd "$SCRIPTS_DIR"
+    if bash deploy-mesh-test.sh; then
+        print_status "✅ Mesh testing applications deployed successfully"
+    else
+        print_error "Mesh testing applications deployment failed"
+        return 1
+    fi
+    
+    cd "$SCRIPT_DIR"
+}
+
+# Test mesh integration
+test_mesh_integration() {   
+    cd "$SCRIPTS_DIR"
+    if bash test-mesh.sh; then
+        print_status "✅ Mesh integration tests passed"
+    else
+        print_error "Mesh integration tests failed"
+        return 1
+    fi
+    
+    cd "$SCRIPT_DIR"
+}
+
+# Clean up Azure resources
+cleanup_azure() {
+    print_header "CLEANING UP AZURE RESOURCES"
+
+    confirm_deletion
+    check_azure_login
+    cleanup_kubeconfig
+    delete_resource_group
+}
+
+# Confirm deletion
+confirm_deletion() {
+    print_warning "This will DELETE the following resources:"
+    echo "  - Resource Group: $RESOURCE_GROUP"
+    echo "  - AKS Cluster: $CLUSTER_NAME"
+    echo "  - VM: $VM_NAME"
+    echo "  - All associated networking, storage, and other resources"
+    echo ""
+    print_warning "This action is IRREVERSIBLE!"
+    echo ""
+    read -p "Are you sure you want to continue? (type 'DELETE' to confirm): " confirmation
+    
+    if [ "$confirmation" != "DELETE" ]; then
+        print_status "Cleanup cancelled."
+        exit 0
+    fi
+}
+
+# Check Azure login
+check_azure_login() {
+    print_status "Checking Azure login..."
+    
+    if ! az account show &> /dev/null; then
+        print_error "Not logged into Azure. Please run 'az login' first."
+        exit 1
+    fi
+}
+
+# Clean up local kubeconfig
+cleanup_kubeconfig() {
+    print_status "Cleaning up local kubeconfig..."
+    
+    # Remove the cluster context from kubeconfig
+    kubectl config delete-context $CLUSTER_NAME 2>/dev/null || true
+    kubectl config delete-cluster $CLUSTER_NAME 2>/dev/null || true
+    kubectl config unset users.clusterUser_${RESOURCE_GROUP}_${CLUSTER_NAME} 2>/dev/null || true
+    
+    print_status "Local kubeconfig cleaned up."
+}
+
+# Delete resource group (this deletes everything)
+delete_resource_group() {
+    print_status "Deleting resource group: $RESOURCE_GROUP"
+    print_warning "This may take several minutes..."
+    
+    # Check if resource group exists
+    if az group show --name $RESOURCE_GROUP &> /dev/null; then
+        az group delete --name $RESOURCE_GROUP --yes --no-wait
+        
+        print_status "Deletion initiated. Checking progress..."
+        
+        # Monitor deletion progress
+        while az group show --name $RESOURCE_GROUP &> /dev/null; do
+            echo -n "."
+            sleep 10
+        done
+        
+        echo ""
+        print_status "Resource group deleted successfully!"
+    else
+        print_warning "Resource group $RESOURCE_GROUP not found. It may have already been deleted."
+    fi
+}
+
+# Clean up local workspace
+cleanup_local() {
+    print_header "CLEANING UP LOCAL WORKSPACE"
+    
+    read -p "This will delete the local workspace '$WORKSPACE_DIR' including Istio samples. Are you sure? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        print_status "Local cleanup cancelled"
+        return 0
+    fi
+    
+    if [ -d "$WORKSPACE_DIR" ]; then
+        print_status "Removing workspace directory and all contents..."
+        print_status "  - Istio installation: $ISTIO_DIR"
+        print_status "  - Istio samples: $ISTIO_DIR/samples"
+        print_status "  - VM mesh setup: $VM_MESH_DIR"
+        print_status "  - Certificates: $CERTS_DIR"
+        print_status "  - Configurations: $CONFIGS_DIR"
+        
+        rm -rf "$WORKSPACE_DIR"
+        print_status "✅ Local workspace cleaned up"
+    else
+        print_status "Local workspace doesn't exist"
+    fi
+
+    if [ -d "$SCRIPTS_DIR/istio-samples" ]; then
+        print_status "Removing Istio samples..."
+        rm -rf "$SCRIPTS_DIR/istio-samples"
+        print_status "✅ Istio samples removed"
+    else
+        print_status "Istio samples directory doesn't exist"
+    fi
+    
+    # Remove symlinks
+    if [ -L "/tmp/vm-mesh-setup" ]; then
+        rm -f "/tmp/vm-mesh-setup"
+        print_status "✅ Symlinks removed"
+    fi
+    
+    # Clean up any temporary Istio downloads
+    if [ -d "/tmp/istio-*" ]; then
+        rm -rf /tmp/istio-*
+        print_status "✅ Temporary Istio files cleaned up"
+    fi
+}
+
+uninstall_istio() {
+  print_status "Uninstalling Istio..."
+
+  kubectl delete -n istio-system -f ./workspace/istio-installation/samples/multicluster/expose-istiod.yaml || true
+
+  istioctl uninstall -y --purge
+  kubectl delete namespace istio-system
+}
+
+# Main execution logic
+main() {
+    parse_arguments "$@"
+    
+    case $COMMAND in
+        help)
+            show_usage
+            exit 0
+            ;;
+        status)
+            show_status
+            ;;
+        setup)
+            complete_setup
+            ;;
+        setup-vm-mesh)
+            create_local_workspace
+            check_prerequisites
+            setup_vm_mesh_integration
+            ;;
+        deploy-samples)
+            create_local_workspace
+            check_prerequisites
+            deploy_samples
+            ;;
+        deploy-mesh-test)
+            create_local_workspace
+            check_prerequisites
+            deploy_mesh_testing
+            ;;
+        test-mesh)
+            create_local_workspace
+            check_prerequisites
+            test_mesh_integration
+            ;;
+        cleanup)
+            cleanup_azure
+            ;;
+        cleanup-local)
+            cleanup_local
+            ;;
+        *)
+            print_error "Unknown command: $COMMAND"
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+# Call main function with all arguments
+main "$@"
