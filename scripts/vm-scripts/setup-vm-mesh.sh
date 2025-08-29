@@ -5,9 +5,9 @@
 set -e
 
 WORK_DIR="/home/azureuser/istio-vm-setup"
-SERVICE_ACCOUNT="vm-workload"
-NAMESPACE="vm-workloads"
-VM_APP="vm-web-service"
+
+# Shared configuration variables
+VM_NAME="istio-vm"
 
 print_status() {
     echo -e "\033[0;32m[INFO]\033[0m $1"
@@ -102,6 +102,18 @@ install_istio_certificates() {
         print_error "Istio token not found - VM will not be able to authenticate with mesh"
         exit 1
     fi
+
+    # Copy hosts
+    if [ -f "hosts" ]; then
+        sudo sh -c "cat $WORK_DIR/hosts >> /etc/hosts"
+        sudo sh -c "echo '127.0.0.1 $VM_NAME' >> /etc/hosts"
+        print_status "✓ Cluster hosts configured"
+    else
+        print_error "Cluster hosts not found"
+        exit 1
+    fi
+        
+    print_status "✓ Istio workload integration certificates configured"
 }
 
 # Download and install Istio with proper error handling
@@ -217,21 +229,13 @@ install_istio_components() {
         exit 1
     fi
 
-    # Copy cluster environment
-    if [ -f "hosts" ]; then
-        sudo cat hosts >> /etc/hosts
-        print_status "✓ Cluster hosts configured"
-    else
-        print_error "Cluster hosts not found"
-        exit 1
-    fi
-
-    sudo chown -R istio-proxy /var/lib/istio \
+    sudo chown -R istio-proxy \
         /etc/certs \
-        /etc/istio/proxy \
-        /etc/istio/config \
         /var/run/secrets \
-        /etc/certs/root-cert.pem
+        /etc/certs/root-cert.pem \
+        /var/lib/istio \
+        /etc/istio/proxy \
+        /etc/istio/config
 
     print_status "✓ Istio workload integration components configured"
 }
@@ -576,7 +580,7 @@ main() {
     
     # Run final health check
     print_status "Running final health check..."
-    if ./check-service.sh; then
+    if $HOME/check-service.sh; then
         print_status "✓ All services are healthy and ready!"
     else
         print_warning "⚠ Some services may need attention. Check logs for details."

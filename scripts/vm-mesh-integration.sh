@@ -8,7 +8,10 @@ set -e
 
 # Shared configuration variables
 RESOURCE_GROUP="istio-playground-rg"
+CLUSTER_NAME="istio-aks-cluster"
 VM_NAME="istio-vm"
+VM_NAMESPACE="vm-workloads"
+VM_APP="vm-web-service"
 
 # Get script directory for relative paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,8 +19,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Use local workspace (can be overridden by environment variable)
 WORK_DIR="$SCRIPT_DIR/../workspace/vm-mesh-setup"
 SERVICE_ACCOUNT="vm-workload"
-VM_NAMESPACE="vm-workloads"
-VM_APP="vm-web-service"
 VM_VERSION="v1.0"
 VM_NETWORK="vm-network" # Multi-Network
 
@@ -108,8 +109,11 @@ spec:
       metrics: 15020
       health: 15021
   probe:
+    periodSeconds: 5
+    initialDelaySeconds: 1
     httpGet:
       port: 8080
+      path: /ready
 EOF
 
     kubectl apply -f "$WORK_DIR/vm-files/workloadgroup.yaml"
@@ -121,7 +125,7 @@ EOF
 apply_vm_config() {
     print_status "Applying VM configuration..."
 
-    # Service configuration with Azure load balancer annotations
+    # Service configuration
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Service
@@ -130,9 +134,6 @@ metadata:
   namespace: $VM_NAMESPACE
   labels:
     app: $VM_APP
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: "/health"
-    service.beta.kubernetes.io/azure-load-balancer-health-probe-interval: "5"
 spec:
   selector:
     app: $VM_APP
@@ -199,7 +200,9 @@ spec:
 EOF
     
     # WorkloadEntry configuration with Azure health checks
-    kubectl apply -f - <<EOF
+    # TODO: The WorkloadEntry is created but with a different name, i.e.: vm-web-service-10.0.0.4-vm-network
+    if ! kubectl get workloadentry -n $VM_NAMESPACE $VM_APP-vm &> /dev/null; then
+        kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1
 kind: WorkloadEntry
 metadata:
@@ -223,6 +226,9 @@ spec:
     metrics: 15020
     health: 15021
 EOF
+    else 
+      print_status "WorkloadEntry $VM_APP-vm already exists, skipping creation."
+    fi
 
     # ServiceEntry configuration with proper Azure networking
     kubectl apply -f - <<EOF
@@ -255,58 +261,6 @@ EOF
     print_status "✓ VM configuration files applied"
 }
 
-# Generate Istio service account token with enhanced security
-# generate_istio_token() {
-#     print_status "Generating Istio service account token with enhanced security..."
-    
-#     # Create token request with expiration
-#     cat > "$WORK_DIR/cluster-configs/tokenrequest.yaml" <<EOF
-# apiVersion: v1
-# kind: Secret
-# metadata:
-#   name: $SERVICE_ACCOUNT-token
-#   namespace: $VM_NAMESPACE
-#   annotations:
-#     kubernetes.io/service-account.name: $SERVICE_ACCOUNT
-# type: kubernetes.io/service-account-token
-# EOF
-
-#     # Apply the token request
-#     kubectl apply -f "$WORK_DIR/cluster-configs/tokenrequest.yaml"
-    
-#     # Wait for token with better error handling
-#     print_status "Waiting for service account token generation..."
-#     local token_ready=false
-#     for i in {1..60}; do
-#         if kubectl get secret $SERVICE_ACCOUNT-token -n $VM_NAMESPACE -o jsonpath='{.data.token}' &>/dev/null; then
-#             local token_data=$(kubectl get secret $SERVICE_ACCOUNT-token -n $VM_NAMESPACE -o jsonpath='{.data.token}' 2>/dev/null)
-#             if [ -n "$token_data" ]; then
-#                 token_ready=true
-#                 break
-#             fi
-#         fi
-#         sleep 2
-#         if [ $((i % 10)) -eq 0 ]; then
-#             print_status "Still waiting for token... ($i/60)"
-#         fi
-#     done
-    
-#     if [ "$token_ready" = false ]; then
-#         print_error "Timeout waiting for service account token generation"
-#         exit 1
-#     fi
-    
-#     # Extract the token to local workspace
-#     kubectl get secret $SERVICE_ACCOUNT-token -n $VM_NAMESPACE -o jsonpath='{.data.token}' | base64 -d > "$WORK_DIR/vm-files/istio-token"
-    
-#     if [ -s "$WORK_DIR/vm-files/istio-token" ]; then
-#         print_status "✓ Istio service account token generated: $WORK_DIR/vm-files/istio-token"
-#     else
-#         print_error "Failed to generate Istio service account token"
-#         exit 1
-#     fi
-# }
-
 # Generate comprehensive VM files with Azure optimizations
 generate_vm_files() {
     print_status "Generating comprehensive VM files for Azure deployment..."
@@ -318,96 +272,8 @@ generate_vm_files() {
         exit 1
     fi
 
-    istioctl x workload entry configure -f "$WORK_DIR/vm-files/workloadgroup.yaml" -o "$WORK_DIR/vm-files" --ingressIP "$istiod_ip"
+    istioctl x workload entry configure -f "$WORK_DIR/vm-files/workloadgroup.yaml" -o "$WORK_DIR/vm-files" --clusterID "${CLUSTER_NAME}" --autoregister
     rm -f "$WORK_DIR/vm-files/workloadgroup.yaml"
-
-#     # Get cluster root certificate
-#     if kubectl get cm istio-ca-root-cert -n $VM_NAMESPACE &>/dev/null; then
-#         kubectl get cm istio-ca-root-cert -n $VM_NAMESPACE -o jsonpath='{.data.root-cert\.pem}' > "$WORK_DIR/vm-files/root-cert.pem"
-#     else
-#         # Fallback to istio-system namespace
-#         kubectl get cm istio-ca-root-cert -n istio-system -o jsonpath='{.data.root-cert\.pem}' > "$WORK_DIR/vm-files/root-cert.pem"
-#     fi
-    
-#     # Store certificate in certificates directory
-#     cp "$WORK_DIR/vm-files/root-cert.pem" "$WORK_DIR/certificates/"
-    
-#     # Generate the Istio token
-#     generate_istio_token
-    
-#     # Get cluster discovery address with Azure-specific configuration
-#     local istiod_ip=$(kubectl get svc istiod -n istio-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
-#     if [ -z "$istiod_ip" ]; then
-#         print_error "Could not get istiod service IP"
-#         exit 1
-#     fi
-    
-#     DISCOVERY_ADDRESS="${istiod_ip}:15012"
-    
-#     # Create cluster environment file with Azure networking considerations
-#     cat > "$WORK_DIR/vm-files/cluster.env" <<EOF
-# # Azure AKS + Istio VM Configuration
-# ISTIO_SERVICE_CIDR=cluster.local
-# ISTIO_INBOUND_PORTS=8080,15020,15021
-# ISTIO_LOCAL_EXCLUDE_PORTS=22,15090,15021,15020,443,80
-# PILOT_DISCOVERY_ADDRESS=$DISCOVERY_ADDRESS
-# ISTIO_PILOT_PORT=15010
-# ISTIO_CP_AUTH=MUTUAL_TLS
-# PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION=true
-
-# # Azure VM specific settings
-# AZURE_METADATA_ENDPOINT=http://169.254.169.254/metadata/instance?api-version=2021-02-01
-# AZURE_VM_SCALE_SET=false
-
-# # Service mesh settings
-# SERVICE_ACCOUNT=$SERVICE_ACCOUNT
-# NAMESPACE=$VM_NAMESPACE
-# WORKLOAD_GROUP=$VM_APP
-# EOF
-
-#     # Create enhanced mesh configuration for Azure
-#     cat > "$WORK_DIR/vm-files/mesh.yaml" <<EOF
-# # Istio Mesh Configuration for Azure VMs
-# defaultConfig:
-#   discoveryAddress: istiod.istio-system.svc:15012
-#   proxyStatsMatcher:
-#     inclusionRegexps:
-#     - ".*outlier_detection.*"
-#     - ".*circuit_breakers.*"
-#     - ".*upstream_rq_retry.*"
-#     - ".*_cx_.*"
-#     - ".*azure.*"
-#   proxyMetadata:
-#     TRUST_DOMAIN: cluster.local
-#     PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION: true
-#     PILOT_ENABLE_IP_AUTOALLOCATE: true
-#     AZURE_METADATA_AVAILABLE: true
-#   holdApplicationUntilProxyStarts: true
-#   statusPort: 15020
-#   proxyAdminPort: 15000
-# defaultProviders:
-#   metrics:
-#   - prometheus
-#   tracing:
-#   - jaeger
-#   accessLogging:
-#   - envoy
-# extensionProviders:
-# - name: prometheus
-#   prometheus:
-#     configOverride:
-#       metric_relabeling_configs:
-#       - source_labels: [__name__]
-#         regex: "istio_.*"
-#         target_label: "azure_workload"
-#         replacement: "vm"
-# - name: jaeger
-#   jaeger:
-#     service: jaeger.istio-system.svc.cluster.local
-#     port: 14250
-# - name: envoy
-#   envoy: {}
-# EOF
 
     # Copy scripts if they exist
     print_status "Preparing VM setup script..."

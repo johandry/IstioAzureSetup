@@ -1,10 +1,18 @@
 #!/bin/bash
-# filepath: /Users/johandry.amador/Workspace/Sandbox/istio/azure-setup/scripts/test-mesh.sh
 
 # Test Istio VM Mesh Integration
 # This script validates VM mesh connectivity and service discovery
 
-set -e
+# Note: We don't use 'set -e' here because we want to continue running all tests
+# even if some fail, and accumulate the failure count
+
+# Shared configuration variables
+VM_NAMESPACE="vm-workloads"
+VM_APP="vm-web-service"
+
+# Configuration variables
+VM_SERVICE_NAME=$VM_APP
+TEST_TIMEOUT=30
 
 # Colors for output
 RED='\033[0;31m'
@@ -39,11 +47,6 @@ print_test_result() {
     fi
 }
 
-# Configuration variables
-VM_NAMESPACE="vm-workloads"
-VM_SERVICE_NAME="vm-web-service"
-TEST_TIMEOUT=30
-
 # Check prerequisites
 check_prerequisites() {
     print_status "Checking test prerequisites..."
@@ -60,48 +63,20 @@ check_prerequisites() {
         exit 1
     fi
     
+    # Ensure mesh-test namespace exists
+    if ! kubectl get namespace mesh-test &> /dev/null; then
+        print_error "Namespace mesh-test not found, please execute: ./setup-istio.sh deploy-mesh-test"
+        exit 1
+    fi
+    
     # Check if sleep pod exists for testing
-    if ! kubectl get deployment sleep &> /dev/null; then
-        print_warning "Sleep pod not found, deploying test pod..."
-        deploy_test_pod
+    if ! kubectl get deployment sleep -n mesh-test &> /dev/null; then
+        print_error "Sleep pod not found, please execute: ./setup-istio.sh deploy-mesh-test"
+        exit 1
     fi
     
     print_status "Prerequisites check passed"
-}
-
-# Deploy a simple test pod if it doesn't exist
-deploy_test_pod() {
-    kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: sleep
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: sleep
-  template:
-    metadata:
-      labels:
-        app: sleep
-    spec:
-      containers:
-      - name: sleep
-        image: curlimages/curl
-        command: ["/bin/sleep", "infinity"]
-        resources:
-          requests:
-            cpu: 50m
-            memory: 64Mi
-          limits:
-            cpu: 200m
-            memory: 256Mi
-EOF
-    
-    kubectl wait --for=condition=available --timeout=120s deployment/sleep
-    print_status "Test pod deployed successfully"
+    return 0
 }
 
 # Test 1: Basic Istio installation
@@ -236,16 +211,17 @@ test_service_discovery() {
     
     # Test DNS resolution for VM service
     ((total++))
-    if kubectl exec deployment/sleep -- nslookup "$VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local" &> /dev/null; then
+    if kubectl exec deployment/sleep -n mesh-test -- nslookup "$VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local" &> /dev/null; then
         print_test_result "PASS" "VM service DNS resolution works"
         ((passed++))
     else
         print_test_result "FAIL" "VM service DNS resolution failed"
     fi
     
+    # TODO: Fix this test
     # Test short name resolution
     ((total++))
-    if kubectl exec deployment/sleep -- nslookup "$VM_SERVICE_NAME.$VM_NAMESPACE" &> /dev/null; then
+    if kubectl exec deployment/sleep -n mesh-test -- nslookup "$VM_SERVICE_NAME.$VM_NAMESPACE" &> /dev/null; then
         print_test_result "PASS" "VM service short name resolution works"
         ((passed++))
     else
@@ -264,7 +240,7 @@ test_service_discovery() {
     fi
     
     if [ -n "$istioctl_path" ]; then
-        if $istioctl_path proxy-config cluster deployment/sleep.default | grep -q "$VM_SERVICE_NAME"; then
+        if $istioctl_path proxy-config cluster deployment/sleep.mesh-test | grep -q "$VM_SERVICE_NAME"; then
             print_test_result "PASS" "VM service found in Istio service registry"
             ((passed++))
         else
@@ -285,36 +261,23 @@ test_connectivity() {
     
     local passed=0
     local total=0
-    
+
+    # TODO: Fix this test
     # Test basic connectivity to VM service
     ((total++))
-    if kubectl exec deployment/sleep -- curl -s --max-time $TEST_TIMEOUT "$VM_SERVICE_NAME.$VM_NAMESPACE:8080" | grep -q "VM Web Service\|nginx\|Welcome"; then
+    if kubectl exec deployment/sleep -n mesh-test -- curl -s --max-time $TEST_TIMEOUT "$VM_SERVICE_NAME.$VM_NAMESPACE:8080" | grep -q "VM Web Service"; then
         print_test_result "PASS" "VM service HTTP connectivity works"
         ((passed++))
     else
         print_test_result "FAIL" "VM service HTTP connectivity failed"
         # Debug information
         print_status "Debug: Testing VM service connectivity..."
-        kubectl exec deployment/sleep -- curl -v --max-time 10 "$VM_SERVICE_NAME.$VM_NAMESPACE:8080" || true
+        kubectl exec deployment/sleep -n mesh-test -- curl -v --max-time 10 "$VM_SERVICE_NAME.$VM_NAMESPACE:8080" || true
     fi
-    
-    # Test connectivity to backup service (if exists)
-    ((total++))
-    if kubectl get deployment vm-web-service-backup -n "$VM_NAMESPACE" &> /dev/null; then
-        if kubectl exec deployment/sleep -- curl -s --max-time $TEST_TIMEOUT "$VM_SERVICE_NAME.$VM_NAMESPACE:8080" | grep -q "backup\|Backup"; then
-            print_test_result "PASS" "VM backup service connectivity works"
-            ((passed++))
-        else
-            print_test_result "FAIL" "VM backup service connectivity failed"
-        fi
-    else
-        print_test_result "SKIP" "VM backup service not deployed"
-        ((passed++)) # Don't count this as a failure
-    fi
-    
+       
     # Test external connectivity (basic)
     ((total++))
-    if kubectl exec deployment/sleep -- curl -s --max-time $TEST_TIMEOUT httpbin.org/headers | grep -q "User-Agent"; then
+    if kubectl exec deployment/sleep -n mesh-test -- curl -s --max-time $TEST_TIMEOUT httpbin.org/headers | grep -q "User-Agent"; then
         print_test_result "PASS" "External connectivity works"
         ((passed++))
     else
@@ -353,7 +316,8 @@ test_gateway_access() {
     else
         print_test_result "FAIL" "Gateway health endpoint not accessible"
     fi
-    
+
+    # TODO: Fix this test. Gateway is forbidden from company network
     # Test VM service through gateway
     ((total++))
     if curl -s --max-time $TEST_TIMEOUT "http://$gateway_ip/vm-service" | grep -q "VM Web Service\|nginx\|Welcome"; then
@@ -425,7 +389,7 @@ test_istio_configuration() {
     
     # Test sidecar injection is working
     ((total++))
-    local injected_pods=$(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[*].name}{"\n"}{end}' | grep -c istio-proxy || echo "0")
+    local injected_pods=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[*].name}{"\n"}{end}' | grep -c istio-proxy)
     if [ "$injected_pods" -gt "0" ]; then
         print_test_result "PASS" "Sidecar injection is working ($injected_pods pods with sidecars)"
         ((passed++))
@@ -466,7 +430,7 @@ show_test_results() {
         echo "   kubectl get workloadentry,serviceentry -n $VM_NAMESPACE"
         echo ""
         echo "3. Check service connectivity:"
-        echo "   kubectl exec deployment/sleep -- curl -v $VM_SERVICE_NAME.$VM_NAMESPACE:8080"
+        echo "   kubectl exec deployment/sleep -n mesh-test -- curl -v $VM_SERVICE_NAME.$VM_NAMESPACE:8080"
         echo ""
         echo "4. View Istio configuration:"
         echo "   istioctl analyze"

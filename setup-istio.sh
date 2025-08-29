@@ -9,7 +9,6 @@ set -e
 
 # Configuration variables
 LOCATION="westus"
-CLUSTER_NAME="istio-aks-cluster"
 NODE_COUNT=3
 NODE_VM_SIZE="Standard_L8s_v3"
 CLUSTER_NETWORK="kube-network" # Multi-Network
@@ -17,6 +16,7 @@ VM_SIZE="Standard_B2s"
 
 # Shared configuration variables
 RESOURCE_GROUP="istio-playground-rg"
+CLUSTER_NAME="istio-aks-cluster"
 VM_NAME="istio-vm"
 
 # Local workspace directories (keep everything in current directory)
@@ -59,27 +59,30 @@ show_usage() {
     echo "Usage: $0 [COMMAND] [OPTIONS]"
     echo ""
     echo "COMMANDS:"
-    echo "  setup              Complete AKS and Istio setup (default)"
-    echo "  setup-vm-mesh      Setup VM mesh integration"
-    echo "  deploy-samples     Deploy Istio sample applications"
-    echo "  deploy-mesh-test   Deploy mesh testing applications"
-    echo "  test-mesh          Test VM mesh integration"
-    echo "  status             Show current deployment status"
-    echo "  cleanup            Clean up all Azure resources"
-    echo "  cleanup-local      Clean up local workspace only"
-    echo "  help               Show this help message"
+    echo "  setup               Complete AKS and Istio setup (default)"
+    echo "  setup-vm-mesh       Setup VM mesh integration"
+    echo "  deploy-samples      Deploy Istio sample applications"
+    echo "  deploy-mesh-test    Deploy mesh testing applications"
+    echo "  test-mesh           Test VM mesh integration"
+    echo "  port-forward [stop] Forward ports for services and dashboards"
+    echo "  status              Show current deployment status"
+    echo "  cleanup [local]     Clean up all Azure resources or local workspace"
+    echo "  uninstall-istio     Uninstall Istio from the cluster"
+    echo "  help                Show this help message"
     echo ""
     echo "OPTIONS:"
     echo "  --resource-group NAME    Override resource group name"
     echo "  --cluster-name NAME      Override cluster name"
-    echo "  --vm-name NAME          Override VM name"
-    echo "  --location LOCATION     Override Azure location"
+    echo "  --vm-name NAME           Override VM name"
+    echo "  --location LOCATION      Override Azure location"
     echo ""
     echo "EXAMPLES:"
-    echo "  $0                      # Complete setup"
+    echo "  $0                     # Complete setup"
     echo "  $0 setup               # Complete setup"
     echo "  $0 setup-vm-mesh       # Setup VM mesh only"
     echo "  $0 deploy-samples      # Deploy sample apps"
+    echo "  $0 port-forward        # Forward ports for services"
+    echo "  $0 port-forward stop   # Stop port forwarding"
     echo "  $0 status              # Check status"
     echo "  $0 cleanup             # Clean everything"
     echo ""
@@ -91,8 +94,16 @@ parse_arguments() {
     
     while [[ $# -gt 0 ]]; do
         case $1 in
-            setup|setup-vm-mesh|deploy-samples|deploy-mesh-test|test-mesh|status|cleanup|cleanup-local|help)
+            setup|setup-vm-mesh|deploy-samples|deploy-mesh-test|test-mesh|port-forward|status|cleanup|uninstall-istio|help)
                 COMMAND="$1"
+                if [ "$1" == "cleanup" ] && [ "$2" == "local" ]; then
+                    COMMAND="cleanup-local"
+                    shift
+                fi
+                if [ "$1" == "port-forward" ] && [ "$2" == "stop" ]; then
+                    COMMAND="stop-port-forward"
+                    shift
+                fi
                 ;;
             --resource-group)
                 RESOURCE_GROUP="$2"
@@ -655,17 +666,22 @@ EOF
 # Deploy HelloWorld sample application with Azure optimized gateway
 deploy_helloworld_sample() {
     print_header "DEPLOYING HELLOWORLD SAMPLE APPLICATION"
-    
+
+
+    kubectl create namespace helloworld --dry-run=client -o yaml | kubectl apply -f - # (idempotent operation)
+     # Label helloworld namespace for Istio injection (idempotent)
+    kubectl label namespace helloworld istio-injection=enabled --overwrite
 
     print_status "Deploying HelloWorld from Istio samples..."
-    kubectl apply -f "$ISTIO_DIR/samples/helloworld/helloworld.yaml"
+    kubectl apply -n helloworld -f "$ISTIO_DIR/samples/helloworld/helloworld.yaml"
 
-    
     # Wait for deployments to be ready
     print_status "Waiting for HelloWorld deployments to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/helloworld-v1 || print_warning "HelloWorld-v1 not ready within timeout"
-    kubectl wait --for=condition=available --timeout=300s deployment/helloworld-v2 || print_warning "HelloWorld-v2 not ready within timeout"
-    
+    kubectl wait --for=condition=available --timeout=300s -n helloworld deployment/helloworld-v1  || print_warning "HelloWorld-v1 not ready within timeout"
+    kubectl wait --for=condition=available --timeout=300s -n helloworld deployment/helloworld-v2  || print_warning "HelloWorld-v2 not ready within timeout"
+    print_status "HelloWorld application deployed. The service 'helloworld' and deployments 'helloworld-v1' and 'helloworld-v2' are now running."
+    print_status "HelloWorld is now accessible at http://<GATEWAY_IP>/hello:"
+
     # Create Gateway and VirtualService for HelloWorld
     print_status "Configuring HelloWorld gateway and routing..."
     kubectl apply -f - <<EOF
@@ -673,7 +689,7 @@ apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: helloworld-gateway
-  namespace: default
+  namespace: helloworld
   labels:
     app: helloworld
     environment: development
@@ -692,7 +708,7 @@ apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: helloworld
-  namespace: default
+  namespace: helloworld
   labels:
     app: helloworld
     environment: development
@@ -725,7 +741,7 @@ apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: helloworld
-  namespace: default
+  namespace: helloworld
   labels:
     app: helloworld
 spec:
@@ -844,18 +860,38 @@ configure_vm() {
     print_status "VM configured for mesh integration"
 }
 
-# Test HelloWorld connectivity and traffic distribution
+# Test HelloWorld connectivity and traffic distribution using port forwarding
 test_helloworld_connectivity() {
-    print_status "Testing HelloWorld connectivity and traffic distribution..."
+    print_status "Testing HelloWorld connectivity and traffic distribution via port forwarding..."
     
-    local gateway_ip=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
-    
-    if [ -z "$gateway_ip" ]; then
-        print_warning "Gateway IP not available yet. Skipping connectivity test."
+    # Check if HelloWorld service exists
+    if ! kubectl get svc helloworld -n helloworld &> /dev/null; then
+        print_warning "HelloWorld service not found in helloworld namespace. Skipping connectivity test."
         return 0
     fi
     
-    print_status "Gateway IP: $gateway_ip"
+    # Find an available port for temporary port forwarding
+    local test_port=8090
+    while lsof -Pi :$test_port -sTCP:LISTEN -t >/dev/null 2>&1; do
+        test_port=$((test_port + 1))
+    done
+    
+    print_status "Using port $test_port for temporary port forwarding..."
+    
+    # Start temporary port forwarding in background
+    kubectl port-forward -n helloworld svc/helloworld "$test_port:5000" &> /dev/null &
+    local port_forward_pid=$!
+    
+    # Give port forwarding time to establish
+    sleep 3
+    
+    # Verify port forwarding is working
+    if ! kill -0 "$port_forward_pid" 2>/dev/null; then
+        print_error "Failed to establish port forwarding for HelloWorld service"
+        return 1
+    fi
+    
+    print_status "Port forwarding established on localhost:$test_port"
     print_status "Testing HelloWorld service (5 requests)..."
     
     local v1_count=0
@@ -863,7 +899,7 @@ test_helloworld_connectivity() {
     local failed_count=0
     
     for i in {1..5}; do
-        local response=$(curl -s --connect-timeout 5 --max-time 10 "http://$gateway_ip/hello" 2>/dev/null)
+        local response=$(curl -s --connect-timeout 5 --max-time 10 "http://localhost:$test_port/hello" 2>/dev/null)
         
         if [ -n "$response" ]; then
             if echo "$response" | grep -q "v1"; then
@@ -873,7 +909,7 @@ test_helloworld_connectivity() {
                 v2_count=$((v2_count + 1))
                 echo "  Request $i: v2 ✓"
             else
-                echo "  Request $i: Unknown response"
+                echo "  Request $i: Unknown response: $response"
                 failed_count=$((failed_count + 1))
             fi
         else
@@ -884,8 +920,15 @@ test_helloworld_connectivity() {
         sleep 1
     done
     
+    # Clean up port forwarding
+    if kill "$port_forward_pid" 2>/dev/null; then
+        print_status "Temporary port forwarding stopped"
+    else
+        print_warning "Failed to stop temporary port forwarding process (PID: $port_forward_pid)"
+    fi
+    
     echo ""
-    print_status "Traffic Distribution Results:"
+    print_status "Traffic Distribution Results (via port forwarding):"
     echo "  HelloWorld v1: $v1_count requests"
     echo "  HelloWorld v2: $v2_count requests"
     echo "  Failed: $failed_count requests"
@@ -934,9 +977,9 @@ get_connection_info() {
     echo ""
     echo "Local Workspace: $WORKSPACE_DIR"
     echo "  ├── istio-installation/    # Istio binaries, samples, and documentation"
-    echo "  │   ├── bin/              # istioctl and other tools"
-    echo "  │   ├── samples/          # Istio sample applications and configurations"
-    echo "  │   └── manifests/        # Istio installation manifests"
+    echo "  │   ├── bin/               # istioctl and other tools"
+    echo "  │   ├── samples/           # Istio sample applications and configurations"
+    echo "  │   └── manifests/         # Istio installation manifests"
     echo "  ├── vm-mesh-setup/         # VM mesh integration files"
     echo "  ├── certs/                 # TLS certificates"
     echo "  └── configs/               # Configuration files"
@@ -956,8 +999,8 @@ get_connection_info() {
         echo "  📊 Kiali Dashboard:     http://$GATEWAY_IP/kiali"
         echo "  📈 Grafana Dashboard:   http://$GATEWAY_IP/grafana"
         echo "  🔍 Jaeger Tracing:      http://$GATEWAY_IP/jaeger"
-        echo "  🖥️  VM Service:          http://$GATEWAY_IP/vm-service"
-        echo "  ❤️  Gateway Health:      http://$GATEWAY_IP/health"
+        echo "  🖥️  VM Service:         http://$GATEWAY_IP/vm-service"
+        echo "  ❤️  Gateway Health:     http://$GATEWAY_IP/health"
     else
         echo "  ⏳ Gateway IP pending assignment..."
         echo "  📊 Port-forward Kiali:   kubectl port-forward -n istio-system svc/kiali 20001:20001"
@@ -980,15 +1023,264 @@ get_connection_info() {
     echo "  Sample Apps: ls -la $ISTIO_DIR/samples/"
     echo ""
     echo "Next Steps:"
-    echo "  1. Test HelloWorld: curl http://$GATEWAY_IP/hello"
-    echo "  2. View Kiali dashboard for service mesh topology"
-    echo "  3. Deploy additional sample applications: ./setup-istio.sh deploy-samples"
-    echo "  4. Set up VM mesh integration: ./setup-istio.sh setup-vm-mesh"
-    echo "  5. Test mesh integration: ./setup-istio.sh deploy-mesh-test"
+    echo "  1. Start Port Forwarding: ./setup-istio.sh port-forward"
+    echo "  2. Test HelloWorld: curl http://localhost:8080/hello"
+    echo "  3. View Kiali dashboard for service mesh topology: http://localhost:20001"
+    echo "  4. Deploy additional sample applications: ./setup-istio.sh deploy-samples"
+    echo "  5. Set up VM mesh integration: ./setup-istio.sh setup-vm-mesh"
+    echo "  6. Test mesh integration: ./setup-istio.sh deploy-mesh-test"
     echo "     then: ./setup-istio.sh test-mesh"
-    echo "  6. Clean up resources when done: ./setup-istio.sh cleanup-azure"
-    echo "     then optionally: ./setup-istio.sh cleanup-local"
+    echo "  7. Stop Port Forwarding: ./setup-istio.sh port-forward stop"
+    echo "  8. Clean up resources when done: ./setup-istio.sh cleanup"
+    echo "     then optionally: ./setup-istio.sh cleanup local"
     echo ""
+}
+
+# Port forwarding function for services and dashboards
+setup_port_forwarding() {
+    print_header "SETTING UP PORT FORWARDING"
+    
+    # Check if kubectl is available and cluster is accessible
+    if ! kubectl cluster-info &> /dev/null; then
+        print_error "Cannot connect to Kubernetes cluster. Please ensure kubectl is configured."
+        return 1
+    fi
+    
+    # Check if any port forwarding is already running
+    if pgrep -f "kubectl port-forward" > /dev/null; then
+        print_warning "Existing kubectl port-forward processes detected."
+        echo "Would you like to stop them first? (y/n)"
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            pkill -f "kubectl port-forward"
+            sleep 2
+            print_status "Existing port-forward processes stopped"
+        fi
+    fi
+    
+    # Array to track background processes
+    declare -a PIDS=()
+    declare -a SERVICES=()
+    
+    print_status "Starting port forwarding for Istio add-ons and applications..."
+    
+    # Function to check if service exists
+    check_service() {
+        local namespace=$1
+        local service=$2
+        kubectl get svc "$service" -n "$namespace" &> /dev/null
+    }
+    
+    # Function to check if port is already in use
+    check_port() {
+        local port=$1
+        if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null ; then
+            return 1  # Port in use
+        else
+            return 0  # Port available
+        fi
+    }
+    
+    # Function to start port forwarding in background
+    start_port_forward() {
+        local namespace=$1
+        local service=$2
+        local local_port=$3
+        local remote_port=$4
+        local description=$5
+        
+        if check_service "$namespace" "$service"; then
+            if check_port "$local_port"; then
+                print_status "Starting port-forward for $description..."
+                kubectl port-forward -n "$namespace" svc/"$service" "$local_port:$remote_port" &> /dev/null &
+                local pid=$!
+                PIDS+=($pid)
+                SERVICES+=("$description")
+                echo "  ✓ $description: http://localhost:$local_port (PID: $pid)"
+                sleep 1  # Give process time to start
+                
+                # Verify the process is still running
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    print_warning "Port forwarding for $description failed to start"
+                fi
+            else
+                print_warning "Port $local_port is already in use, skipping $description"
+            fi
+        else
+            print_warning "Service $service not found in namespace $namespace, skipping $description"
+        fi
+    }
+    
+    # Function to check if deployment/pod exists
+    check_deployment() {
+        local namespace=$1
+        local selector=$2
+        kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null | grep -q "Running"
+    }
+    
+    # Start port forwarding for Istio add-ons
+    echo ""
+    echo "Istio Add-ons:"
+    start_port_forward "istio-system" "kiali" "20001" "20001" "Kiali Dashboard"
+    start_port_forward "istio-system" "grafana" "3000" "3000" "Grafana Dashboard" 
+    start_port_forward "istio-system" "jaeger" "16686" "16686" "Jaeger Tracing"
+    start_port_forward "istio-system" "prometheus" "9090" "9090" "Prometheus"
+    
+    # Start port forwarding for HelloWorld app
+    echo ""
+    echo "Applications:"
+    if check_deployment "default" "app=helloworld"; then
+        if check_port "8080"; then
+            print_status "Starting port-forward for HelloWorld app..."
+            kubectl port-forward -n default svc/helloworld "8080:5000" &> /dev/null &
+            local helloworld_pid=$!
+            PIDS+=($helloworld_pid)
+            SERVICES+=("HelloWorld App")
+            echo "  ✓ HelloWorld App: http://localhost:8080/hello (PID: $helloworld_pid)"
+            sleep 1
+        else
+            print_warning "Port 8080 is already in use, trying alternative port 8082..."
+            if check_port "8082"; then
+                kubectl port-forward -n default svc/helloworld "8082:5000" &> /dev/null &
+                local helloworld_pid=$!
+                PIDS+=($helloworld_pid)
+                SERVICES+=("HelloWorld App")
+                echo "  ✓ HelloWorld App: http://localhost:8082/hello (PID: $helloworld_pid)"
+            else
+                print_warning "Both ports 8080 and 8082 are in use, skipping HelloWorld"
+            fi
+        fi
+    else
+        print_warning "HelloWorld deployment not found, skipping"
+    fi
+    
+    # Start port forwarding for VM web service (if deployed)
+    if check_service "vm-workloads" "vm-web-service"; then
+        start_port_forward "vm-workloads" "vm-web-service" "8081" "8080" "VM Web Service"
+    else
+        print_warning "VM Web Service not found in vm-workloads namespace, skipping"
+    fi
+    
+    echo ""
+    
+    if [ ${#PIDS[@]} -eq 0 ]; then
+        print_warning "No services were successfully port-forwarded."
+        print_warning "Make sure your applications are deployed and services are running."
+        return 1
+    fi
+    
+    print_status "Port forwarding setup complete!"
+    echo ""
+    echo "Successfully started port forwarding for ${#PIDS[@]} service(s):"
+    for i in "${!SERVICES[@]}"; do
+        echo "  - ${SERVICES[$i]}"
+    done
+    echo ""
+    echo "Access URLs:"
+    echo "  📊 Kiali Dashboard:     http://localhost:20001"
+    echo "  📈 Grafana Dashboard:   http://localhost:3000"
+    echo "  🔍 Jaeger Tracing:      http://localhost:16686"
+    echo "  📊 Prometheus:          http://localhost:9090"
+    echo "  🌍 HelloWorld App:      http://localhost:8080/hello (or http://localhost:8082/hello)"
+    echo "  🖥️  VM Web Service:      http://localhost:8081"
+    echo ""
+    echo "Background Process IDs: ${PIDS[*]}"
+    echo ""
+    echo "Management Commands:"
+    echo "  To stop all port forwarding:"
+    echo "    ./setup-istio.sh port-forward stop"
+    echo "  Or manually:"
+    echo "    kill ${PIDS[*]}"
+    echo "    # Or use: pkill -f 'kubectl port-forward'"
+    echo ""
+    echo "To check running port forwards:"
+    echo "  ps aux | grep 'kubectl port-forward'"
+    echo "  netstat -tulpn | grep LISTEN | grep -E ':(20001|3000|16686|9090|8080|8081)'"
+    echo ""
+    
+    # Save PIDs to a file for later cleanup
+    if [ ${#PIDS[@]} -gt 0 ]; then
+        echo "${PIDS[*]}" > "$WORKSPACE_DIR/port-forward-pids.txt"
+        print_status "Process IDs saved to $WORKSPACE_DIR/port-forward-pids.txt"
+    fi
+    
+    echo "Press Ctrl+C to stop this script, but port forwarding will continue in the background."
+    echo "Press Enter to continue..."
+    read -r
+}
+
+# Stop port forwarding processes
+stop_port_forwarding() {
+    print_header "STOPPING PORT FORWARDING"
+    
+    local pids_file="$WORKSPACE_DIR/port-forward-pids.txt"
+    local stopped_count=0
+    local already_stopped_count=0
+    
+    if [ -f "$pids_file" ]; then
+        print_status "Reading saved process IDs from $pids_file..."
+        local pids=$(cat "$pids_file")
+        
+        if [ -n "$pids" ]; then
+            print_status "Stopping port forwarding processes: $pids"
+            
+            for pid in $pids; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    if kill "$pid" 2>/dev/null; then
+                        echo "  ✓ Stopped process $pid"
+                        stopped_count=$((stopped_count + 1))
+                    else
+                        echo "  ✗ Failed to stop process $pid"
+                    fi
+                else
+                    echo "  - Process $pid already stopped"
+                    already_stopped_count=$((already_stopped_count + 1))
+                fi
+            done
+            
+            # Wait a moment for processes to terminate
+            sleep 2
+            
+            # Clean up the PID file
+            rm -f "$pids_file"
+            print_status "Process IDs file cleaned up"
+        else
+            print_warning "No process IDs found in file"
+        fi
+    else
+        print_warning "No saved process IDs found."
+    fi
+    
+    # Always attempt to clean up any remaining kubectl port-forward processes
+    print_status "Checking for any remaining kubectl port-forward processes..."
+    local remaining_pids=$(pgrep -f "kubectl port-forward" || true)
+    
+    if [ -n "$remaining_pids" ]; then
+        print_status "Found additional kubectl port-forward processes: $remaining_pids"
+        if pkill -f "kubectl port-forward"; then
+            print_status "Successfully stopped additional port-forward processes"
+            stopped_count=$((stopped_count + $(echo "$remaining_pids" | wc -w)))
+        else
+            print_warning "Failed to stop some port-forward processes"
+        fi
+    else
+        print_status "No additional kubectl port-forward processes found"
+    fi
+    
+    echo ""
+    print_status "Port forwarding cleanup complete!"
+    echo "  Processes stopped: $stopped_count"
+    echo "  Already stopped: $already_stopped_count"
+    echo ""
+    
+    # Verify no port forwards are still running
+    local still_running=$(pgrep -f "kubectl port-forward" | wc -l || true)
+    if [ "$still_running" -eq 0 ]; then
+        print_status "✅ All kubectl port-forward processes have been stopped"
+    else
+        print_warning "⚠️  $still_running kubectl port-forward processes may still be running"
+        echo "Run 'ps aux | grep \"kubectl port-forward\"' to check manually"
+    fi
 }
 
 # Complete setup (updated to include HelloWorld)
@@ -1006,7 +1298,7 @@ complete_setup() {
     deploy_helloworld_sample
     setup_tls_certificate # TODO: this may not be required
     configure_vm
-    # test_helloworld_connectivity
+    test_helloworld_connectivity
     get_connection_info
     
     print_status "✅ Complete setup with HelloWorld sample finished successfully!"
@@ -1201,10 +1493,17 @@ cleanup_local() {
 uninstall_istio() {
   print_status "Uninstalling Istio..."
 
-  kubectl delete -n istio-system -f ./workspace/istio-installation/samples/multicluster/expose-istiod.yaml || true
+  VM_IP=$(az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query publicIps -o tsv 2>/dev/null)
+  if [ -n "$VM_IP" ]; then
+      ssh -o StrictHostKeyChecking=no azureuser@$VM_IP "sudo systemctl stop istio && sudo dpkg -r istio-sidecar && dpkg -s istio-sidecar" 2>/dev/null || print_warning "Could not stop Istio service on VM or service not found"
+  fi
 
-  istioctl uninstall -y --purge
-  kubectl delete namespace istio-system
+  kubectl delete -n istio-system -f ./workspace/istio-installation/samples/multicluster/expose-istiod.yaml 2>/dev/null || true
+
+  istioctl uninstall -y --purge 2>/dev/null || true
+  kubectl delete namespace istio-system 2>/dev/null || true
+
+  print_status "✅ Istio uninstalled from the cluster"
 }
 
 # Main execution logic
@@ -1242,11 +1541,22 @@ main() {
             check_prerequisites
             test_mesh_integration
             ;;
+        port-forward)
+            create_local_workspace
+            check_prerequisites
+            setup_port_forwarding
+            ;;
+        stop-port-forward)
+            stop_port_forwarding
+            ;;
         cleanup)
             cleanup_azure
             ;;
         cleanup-local)
             cleanup_local
+            ;;
+        uninstall-istio)
+            uninstall_istio
             ;;
         *)
             print_error "Unknown command: $COMMAND"

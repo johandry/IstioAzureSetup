@@ -5,6 +5,13 @@
 
 set -e
 
+# Shared configuration variables
+VM_NAMESPACE="vm-workloads"
+VM_APP="vm-web-service"
+
+# Configuration variables
+VM_SERVICE_NAME=$VM_APP
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,14 +37,95 @@ print_header() {
     echo -e "${BLUE}========================================${NC}"
 }
 
-# Check if we're connected to a Kubernetes cluster
-check_cluster_connection() {
+# Check prerequisites
+check_prerequisites() {
+    print_status "Checking prerequisites..."
+
     if ! kubectl cluster-info &> /dev/null; then
         print_error "Not connected to a Kubernetes cluster"
         exit 1
     fi
-    
     print_status "Connected to cluster: $(kubectl config current-context)"
+
+    # Check if Istio is installed
+    print_status "Checking Istio installation..."
+    if ! kubectl get namespace istio-system &> /dev/null; then
+        print_error "Istio system namespace not found. Please install Istio first."
+        exit 1
+    fi
+    
+    # Check if Istio control plane is running
+    if ! kubectl get deployment istiod -n istio-system &> /dev/null; then
+        print_error "Istio control plane (istiod) not found. Please install Istio first."
+        exit 1
+    fi
+    
+    # Check if istiod is ready
+    if ! kubectl wait --for=condition=available --timeout=30s deployment/istiod -n istio-system &> /dev/null; then
+        print_error "Istio control plane is not ready. Please check Istio installation."
+        exit 1
+    fi
+    print_status "✓ Istio control plane is running"
+    
+    # Check if Istio gateway is deployed
+    if kubectl get service istio-ingressgateway -n istio-system &> /dev/null; then
+        print_status "✓ Istio ingress gateway is deployed"
+    else
+        print_warning "Istio ingress gateway not found"
+    fi
+    
+    # Check VM workloads namespace and mesh integration
+    print_status "Checking VM mesh integration..."
+    if ! kubectl get namespace $VM_NAMESPACE &> /dev/null; then
+        print_error "VM workloads namespace not found. Execute ./setup-istio.sh setup-vm-mesh"
+        exit 1
+    else
+        print_status "✓ VM workloads namespace exists"
+        
+        # Check if VM workloads namespace has Istio injection enabled
+        if kubectl get namespace $VM_NAMESPACE -o jsonpath='{.metadata.labels.istio-injection}' | grep -q enabled; then
+            print_status "✓ VM workloads namespace has Istio injection enabled"
+        else
+            print_warning "VM workloads namespace does not have Istio injection enabled"
+        fi
+        
+        # Check for VM-related resources
+        if kubectl get workloadgroup -n $VM_NAMESPACE &> /dev/null; then
+            print_status "✓ WorkloadGroup resources found in $VM_NAMESPACE namespace"
+        else
+            print_warning "No WorkloadGroup resources found in $VM_NAMESPACE namespace"
+        fi
+        
+        # Check for VM web service
+        if kubectl get service $VM_SERVICE_NAME -n $VM_NAMESPACE &> /dev/null; then
+            print_status "✓ VM web service found in $VM_NAMESPACE namespace"
+        else
+            print_warning "VM web service not found in $VM_NAMESPACE namespace"
+        fi
+        
+        # Check for VM workload entries
+        if kubectl get workloadentry -n $VM_NAMESPACE &> /dev/null; then
+            VM_ENTRIES=$(kubectl get workloadentry -n $VM_NAMESPACE --no-headers | wc -l | tr -d ' ')
+            print_status "✓ Found $VM_ENTRIES VM WorkloadEntry resources"
+        else
+            print_warning "No VM WorkloadEntry resources found"
+        fi
+    fi
+
+    print_status "Prerequisites check passed!"
+}
+
+# Create and configure the mesh-test namespace
+create_mesh_test_namespace() {
+    print_status "Creating mesh-test namespace..."
+    
+    # Create namespace if it doesn't exist
+    kubectl create namespace mesh-test --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Label namespace for Istio injection
+    kubectl label namespace mesh-test istio-injection=enabled --overwrite
+    
+    print_status "✅ mesh-test namespace created and configured for Istio injection"
 }
 
 # Deploy sleep pod for testing
@@ -45,11 +133,11 @@ deploy_sleep_pod() {
     print_status "Deploying sleep pod for testing..."
     
     # Check if sleep deployment already exists with different selector
-    if kubectl get deployment sleep &> /dev/null; then
+    if kubectl get deployment sleep -n mesh-test &> /dev/null; then
         print_status "Sleep deployment exists, deleting and recreating..."
-        kubectl delete deployment sleep --ignore-not-found=true
-        kubectl delete service sleep --ignore-not-found=true
-        kubectl delete serviceaccount sleep --ignore-not-found=true
+        kubectl delete deployment sleep -n mesh-test --ignore-not-found=true
+        kubectl delete service sleep -n mesh-test --ignore-not-found=true
+        kubectl delete serviceaccount sleep -n mesh-test --ignore-not-found=true
         sleep 10  # Wait for resources to be fully deleted
     fi
     
@@ -58,13 +146,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: sleep
-  namespace: default
+  namespace: mesh-test
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: sleep
-  namespace: default
+  namespace: mesh-test
   labels:
     app: sleep
     service: sleep
@@ -79,7 +167,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: sleep
-  namespace: default
+  namespace: mesh-test
 spec:
   replicas: 1
   selector:
@@ -108,7 +196,7 @@ spec:
 EOF
     
     print_status "Waiting for sleep pod to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/sleep
+    kubectl wait --for=condition=available --timeout=300s deployment/sleep -n mesh-test
 }
 
 # Deploy HTTPBin service for testing
@@ -116,11 +204,11 @@ deploy_httpbin_test() {
     print_status "Deploying HTTPBin test service..."
     
     # Check if httpbin deployment already exists with different selector
-    if kubectl get deployment httpbin &> /dev/null; then
+    if kubectl get deployment httpbin -n mesh-test &> /dev/null; then
         print_status "HTTPBin deployment exists, deleting and recreating..."
-        kubectl delete deployment httpbin --ignore-not-found=true
-        kubectl delete service httpbin --ignore-not-found=true
-        kubectl delete serviceaccount httpbin --ignore-not-found=true
+        kubectl delete deployment httpbin -n mesh-test --ignore-not-found=true
+        kubectl delete service httpbin -n mesh-test --ignore-not-found=true
+        kubectl delete serviceaccount httpbin -n mesh-test --ignore-not-found=true
         sleep 10  # Wait for resources to be fully deleted
     fi
     
@@ -129,13 +217,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: httpbin
-  namespace: default
+  namespace: mesh-test
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: httpbin
-  namespace: default
+  namespace: mesh-test
   labels:
     app: httpbin
     service: httpbin
@@ -151,7 +239,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: httpbin
-  namespace: default
+  namespace: mesh-test
 spec:
   replicas: 1
   selector:
@@ -180,102 +268,7 @@ spec:
 EOF
     
     print_status "Waiting for HTTPBin to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/httpbin
-}
-
-# Deploy test namespace for VM workloads
-deploy_vm_test_namespace() {
-    print_status "Creating VM workloads test namespace..."
-    
-    kubectl create namespace vm-workloads --dry-run=client -o yaml | kubectl apply -f -
-    kubectl label namespace vm-workloads istio-injection=enabled --overwrite
-    
-    # Check if vm-web-service-backup deployment exists and handle it
-    if kubectl get deployment vm-web-service-backup -n vm-workloads &> /dev/null; then
-        print_status "VM web service backup deployment exists, updating..."
-        kubectl delete deployment vm-web-service-backup -n vm-workloads --ignore-not-found=true
-        sleep 5
-    fi
-    
-    # Deploy a test service that mimics VM workload
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: vm-web-service
-  namespace: vm-workloads
-  labels:
-    app: vm-web-service
-    service: vm-web-service
-spec:
-  ports:
-  - port: 8080
-    name: http
-  selector:
-    app: vm-web-service
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: vm-web-content
-  namespace: vm-workloads
-data:
-  index.html: |
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>VM Web Service (Backup)</title>
-    </head>
-    <body>
-        <h1>VM Web Service - Backup Instance</h1>
-        <p>This is a backup instance running in Kubernetes</p>
-        <p>Source: Kubernetes Pod</p>
-        <p>Version: backup</p>
-        <p>Timestamp: $(date)</p>
-    </body>
-    </html>
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: vm-web-service-backup
-  namespace: vm-workloads
-  labels:
-    app: vm-web-service
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: vm-web-service
-      version: backup
-  template:
-    metadata:
-      labels:
-        app: vm-web-service
-        version: backup
-    spec:
-      containers:
-      - name: web-service
-        image: nginx:alpine
-        ports:
-        - containerPort: 80
-        resources:
-          requests:
-            cpu: 50m
-            memory: 64Mi
-          limits:
-            cpu: 200m
-            memory: 256Mi
-        volumeMounts:
-        - name: html
-          mountPath: /usr/share/nginx/html
-      volumes:
-      - name: html
-        configMap:
-          name: vm-web-content
-EOF
-    
-    print_status "VM test namespace and backup service created"
+    kubectl wait --for=condition=available --timeout=300s deployment/httpbin -n mesh-test
 }
 
 # Deploy network testing utilities
@@ -283,14 +276,14 @@ deploy_network_tools() {
     print_status "Deploying network testing utilities..."
     
     # Delete existing netshoot pod if it exists
-    kubectl delete pod netshoot --ignore-not-found=true
+    kubectl delete pod netshoot -n mesh-test --ignore-not-found=true
     
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
   name: netshoot
-  namespace: default
+  namespace: mesh-test
   labels:
     app: netshoot
 spec:
@@ -308,7 +301,7 @@ spec:
 EOF
     
     print_status "Waiting for network tools to be ready..."
-    kubectl wait --for=condition=ready --timeout=300s pod/netshoot
+    kubectl wait --for=condition=ready --timeout=300s pod/netshoot -n mesh-test
 }
 
 # Create Gateway and VirtualService for test services
@@ -316,14 +309,14 @@ configure_test_gateway() {
     print_status "Configuring gateway for test services..."
     
     # Delete existing VirtualService if it exists
-    kubectl delete virtualservice test-services --ignore-not-found=true
+    kubectl delete virtualservice test-services -n mesh-test --ignore-not-found=true
     
     kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: test-services
-  namespace: default
+  namespace: mesh-test
 spec:
   hosts:
   - "*"
@@ -337,7 +330,7 @@ spec:
       uri: /
     route:
     - destination:
-        host: httpbin.default.svc.cluster.local
+        host: httpbin.mesh-test.svc.cluster.local
         port:
           number: 8000
   - match:
@@ -345,7 +338,7 @@ spec:
         prefix: /headers
     route:
     - destination:
-        host: httpbin.default.svc.cluster.local
+        host: httpbin.mesh-test.svc.cluster.local
         port:
           number: 8000
     rewrite:
@@ -355,9 +348,9 @@ spec:
         prefix: /vm-test
     route:
     - destination:
-        host: vm-web-service.vm-workloads.svc.cluster.local
+        host: $VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local
         port:
-          number: 8080
+          number: 5000
 EOF
     
     print_status "Test gateway configuration applied"
@@ -368,40 +361,34 @@ validate_deployments() {
     print_status "Validating test deployments..."
     
     # Check sleep pod
-    if kubectl get pod -l app=sleep | grep -q Running; then
+    if kubectl get pod -l app=sleep -n mesh-test | grep -q Running; then
         print_status "✓ Sleep pod is running"
     else
         print_warning "Sleep pod is not running"
-        kubectl get pods -l app=sleep
+        kubectl get pods -l app=sleep -n mesh-test
     fi
     
     # Check HTTPBin
-    if kubectl get pod -l app=httpbin | grep -q Running; then
+    if kubectl get pod -l app=httpbin -n mesh-test | grep -q Running; then
         print_status "✓ HTTPBin is running"
     else
         print_warning "HTTPBin is not running"
-        kubectl get pods -l app=httpbin
+        kubectl get pods -l app=httpbin -n mesh-test
     fi
     
     # Check VM namespace
-    if kubectl get namespace vm-workloads &> /dev/null; then
+    if kubectl get namespace $VM_NAMESPACE &> /dev/null; then
         print_status "✓ VM workloads namespace exists"
-        if kubectl get pod -l app=vm-web-service -n vm-workloads | grep -q Running; then
-            print_status "✓ VM web service backup is running"
-        else
-            print_warning "VM web service backup is not running"
-            kubectl get pods -l app=vm-web-service -n vm-workloads
-        fi
     else
         print_warning "VM workloads namespace not found"
     fi
     
     # Check netshoot
-    if kubectl get pod netshoot | grep -q Running; then
+    if kubectl get pod netshoot -n mesh-test | grep -q Running; then
         print_status "✓ Network tools pod is running"
     else
         print_warning "Network tools pod is not running"
-        kubectl get pod netshoot
+        kubectl get pod netshoot -n mesh-test
     fi
 }
 
@@ -414,32 +401,32 @@ run_basic_tests() {
     
     # Test HTTPBin from sleep pod
     print_status "Testing HTTPBin connectivity from sleep pod..."
-    if kubectl exec deployment/sleep -- curl -s --max-time 10 httpbin:8000/headers | grep -q "User-Agent"; then
+    if kubectl exec deployment/sleep -n mesh-test -- curl -s --max-time 10 httpbin:8000/headers | grep -q "User-Agent"; then
         print_status "✓ Sleep → HTTPBin connectivity works"
     else
         print_warning "Sleep → HTTPBin connectivity failed"
         print_status "Debugging HTTPBin connectivity..."
-        kubectl exec deployment/sleep -- nslookup httpbin || true
-        kubectl get svc httpbin || true
+        kubectl exec deployment/sleep -n mesh-test -- nslookup httpbin || true
+        kubectl get svc httpbin -n mesh-test || true
     fi
     
     # Test external connectivity
     print_status "Testing external connectivity..."
-    if kubectl exec deployment/sleep -- curl -s --max-time 10 httpbin.org/headers | grep -q "User-Agent"; then
-        print_status "✓ External connectivity works"
+    if kubectl exec deployment/sleep -n mesh-test -- curl -s --max-time 10 httpbin.org/headers | grep -q "User-Agent"; then
+        print_status "✓ Sleep → External HTTPBin.org connectivity works"
     else
-        print_warning "External connectivity failed (this might be expected in restricted networks)"
+        print_warning "Sleep → External HTTPBin.org connectivity failed (this might be expected in restricted networks)"
     fi
     
     # Test VM service connectivity
     print_status "Testing VM service connectivity..."
-    if kubectl exec deployment/sleep -- curl -s --max-time 10 vm-web-service.vm-workloads:8080 | grep -q "VM Web Service"; then
+    if kubectl exec deployment/sleep -n mesh-test -- curl -s --max-time 10 $VM_SERVICE_NAME.$VM_NAMESPACE:8080 | grep -q "VM Web Service"; then
         print_status "✓ Sleep → VM service connectivity works"
     else
         print_warning "Sleep → VM service connectivity failed"
         print_status "Debugging VM service connectivity..."
-        kubectl exec deployment/sleep -- nslookup vm-web-service.vm-workloads || true
-        kubectl get svc vm-web-service -n vm-workloads || true
+        kubectl exec deployment/sleep -n mesh-test -- nslookup $VM_SERVICE_NAME.$VM_NAMESPACE || true
+        kubectl get svc $VM_SERVICE_NAME -n $VM_NAMESPACE || true
     fi
 }
 
@@ -450,24 +437,24 @@ show_test_results() {
     echo ""
     print_status "✅ Mesh testing applications deployed successfully!"
     echo ""
-    echo "Available test services:"
-    echo "  - Sleep pod: kubectl exec -it deployment/sleep -- sh"
-    echo "  - HTTPBin: kubectl exec -it deployment/httpbin -- sh"  
-    echo "  - Network tools: kubectl exec -it pod/netshoot -- bash"
+    echo "Available test services (in mesh-test namespace):"
+    echo "  - Sleep pod: kubectl exec -it deployment/sleep -n mesh-test -- sh"
+    echo "  - HTTPBin: kubectl exec -it deployment/httpbin -n mesh-test -- sh"  
+    echo "  - Network tools: kubectl exec -it pod/netshoot -n mesh-test -- bash"
     echo ""
     echo "Manual test commands:"
     echo "  # Test HTTPBin service"
-    echo "  kubectl exec -it deployment/sleep -- curl httpbin:8000/headers"
+    echo "  kubectl exec -it deployment/sleep -n mesh-test -- curl httpbin:8000/headers"
     echo ""
     echo "  # Test VM web service (backup)"
-    echo "  kubectl exec -it deployment/sleep -- curl vm-web-service.vm-workloads:8080"
+    echo "  kubectl exec -it deployment/sleep -n mesh-test -- curl $VM_SERVICE_NAME.$VM_NAMESPACE:8080"
     echo ""
     echo "  # DNS resolution tests"
-    echo "  kubectl exec -it pod/netshoot -- nslookup httpbin.default.svc.cluster.local"
-    echo "  kubectl exec -it pod/netshoot -- nslookup vm-web-service.vm-workloads.svc.cluster.local"
+    echo "  kubectl exec -it pod/netshoot -n mesh-test -- nslookup httpbin.mesh-test.svc.cluster.local"
+    echo "  kubectl exec -it pod/netshoot -n mesh-test -- nslookup $VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local"
     echo ""
     echo "  # Network connectivity tests"
-    echo "  kubectl exec -it pod/netshoot -- ping httpbin.default.svc.cluster.local"
+    echo "  kubectl exec -it pod/netshoot -n mesh-test -- ping httpbin.mesh-test.svc.cluster.local"
     echo ""
     
     # Show gateway access if available
@@ -489,10 +476,10 @@ show_test_results() {
 main() {
     print_header "DEPLOYING MESH TESTING APPLICATIONS"
     
-    check_cluster_connection
+    check_prerequisites
+    create_mesh_test_namespace
     deploy_sleep_pod
     deploy_httpbin_test
-    deploy_vm_test_namespace
     deploy_network_tools
     configure_test_gateway
     validate_deployments
