@@ -6,7 +6,6 @@ This repository provides a comprehensive, automated setup for deploying Istio se
 
 - **Automated AKS + Istio Setup**: Complete setup with Azure-optimized configurations
 - **HelloWorld Sample**: Deployed automatically during setup with traffic distribution
-- **Azure Load Balancer Integration**: Properly configured external access with health probes
 - **VM Mesh Integration**: Connect external VMs to the service mesh
 - **Sample Applications**: Bookinfo, HTTPBin, and other Istio samples
 - **Observability Tools**: Kiali, Grafana, and Jaeger with gateway access
@@ -42,9 +41,8 @@ az login
 ### 1. Clone and Setup
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/johandry/IstioAzureSetup.git
 cd azure-setup
-chmod +x setup-istio.sh
 ```
 
 ### 2. Complete Setup (Recommended)
@@ -58,7 +56,6 @@ This command will:
 - Create Azure Resource Group, AKS cluster, and VM
 - Install and configure Istio with Azure optimizations
 - Deploy HelloWorld sample application
-- Configure Azure Load Balancer with health probes
 - Set up observability tools (Kiali, Grafana, Jaeger)
 - Create local workspace with Istio samples
 
@@ -66,13 +63,13 @@ This command will:
 
 ```bash
 # Get the external IP (may take a few minutes to assign)
-kubectl get svc istio-ingressgateway -n istio-system
+GATEWAY_IP=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
-# Test HelloWorld (replace <EXTERNAL-IP> with actual IP)
-curl http://<EXTERNAL-IP>/hello
+# Test HelloWorld
+curl http://$GATEWAY_IP/hello
 
 # Test load balancing between v1 and v2
-for i in {1..10}; do curl http://<EXTERNAL-IP>/hello; echo; done
+for i in {1..10}; do curl http://$GATEWAY_IP/hello; echo; done
 ```
 
 ## 🎯 Available Commands
@@ -89,8 +86,9 @@ for i in {1..10}; do curl http://<EXTERNAL-IP>/hello; echo; done
 - `deploy-mesh-test` - Deploy mesh testing applications
 - `test-mesh` - Test VM mesh integration
 - `status` - Show current deployment status
+- `port-forward [stop]` Forward ports for services and dashboards
 - `cleanup` - Clean up all Azure resources
-- `cleanup-local` - Clean up local workspace only
+- `cleanup local` - Clean up local workspace only
 - `help` - Show usage information
 
 ### Options
@@ -99,7 +97,6 @@ for i in {1..10}; do curl http://<EXTERNAL-IP>/hello; echo; done
 - `--cluster-name NAME` - Override cluster name
 - `--vm-name NAME` - Override VM name
 - `--location LOCATION` - Override Azure location
-- `--verbose` - Enable verbose output
 
 ## 🌐 Access Your Applications
 
@@ -131,7 +128,7 @@ After successful setup, you'll have access to:
 The setup creates an organized local workspace:
 
 ```tree
-azure-setup/
+IstioAzureSetup/
 ├── setup-istio.sh                 # Main setup script
 ├── scripts/                       # Additional deployment scripts
 └── workspace/                     # Local workspace (created during setup)
@@ -154,14 +151,6 @@ azure-setup/
 - **VM Size**: Standard_L8s_v3 (optimized for networking)
 - **Network Plugin**: Azure CNI
 - **Monitoring**: Enabled with Azure Monitor
-
-### Load Balancer Configuration
-
-- **Type**: Azure Load Balancer (Standard SKU)
-- **Health Probes**: Configured for `/stats/ready` endpoint
-- **Session Affinity**: ClientIP with 300s timeout
-- **Traffic Policy**: Local (for better performance)
-- **DNS Label**: `<cluster-name>-istio`
 
 ### Security Features
 
@@ -238,6 +227,6 @@ istioctl proxy-status
 ### Clean Up Local Workspace Only
 
 ```bash
-./setup-istio.sh cleanup-local
+./setup-istio.sh cleanup local
 # This removes only the local workspace directory
 ```
