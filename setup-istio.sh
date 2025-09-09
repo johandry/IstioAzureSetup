@@ -387,14 +387,26 @@ create_vm() {
         print_status "VM $VM_NAME created successfully"
     fi
     
-    # Ensure SSH port is open (idempotent operation)
-    az vm open-port --port 22 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
+    # Explicitly create NSG rules for required ports (visible in Azure portal)
+    # Get NIC name associated with the VM
+    NIC_NAME=$(az vm show --resource-group $RESOURCE_GROUP --name $VM_NAME --query 'networkProfile.networkInterfaces[0].id' -o tsv | awk -F/ '{print $NF}')
+    # Get NSG name from NIC
+    NSG_NAME=$(az network nic show --resource-group $RESOURCE_GROUP --name "$NIC_NAME" --query 'networkSecurityGroup.id' -o tsv | awk -F/ '{print $NF}')
+    if [ -z "$NSG_NAME" ]; then
+        NSG_NAME=$(az network nsg list --resource-group $RESOURCE_GROUP --query "[0].name" -o tsv)
+    fi
 
-    # Open application ports for access (idempotent)
-    az vm open-port --port 8080 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
-    az vm open-port --port 443  --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
-    az vm open-port --port 15000-15090 --resource-group $RESOURCE_GROUP --name $VM_NAME &> /dev/null || true
-    print_status "Application ports (8080, 443, 15000-15090) opened on VM"
+    # Open SSH port 22
+
+    az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name "$NSG_NAME" --name Allow-SSH --priority 1001 --direction Inbound --access Allow --protocol Tcp --source-address-prefixes '*' --destination-port-ranges 22 --destination-address-prefixes '*' --description "Allow SSH" &> /dev/null
+
+    az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name "$NSG_NAME" --name Allow-VMWeb8080 --priority 1002 --direction Inbound --access Allow --protocol Tcp --source-address-prefixes '*' --destination-port-ranges 8080 --destination-address-prefixes '*' --description "Allow VM Web Service" &> /dev/null
+
+    az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name "$NSG_NAME" --name Allow-HTTPS443 --priority 1003 --direction Inbound --access Allow --protocol Tcp --source-address-prefixes '*' --destination-port-ranges 443 --destination-address-prefixes '*' --description "Allow HTTPS" &> /dev/null
+
+    az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name "$NSG_NAME" --name Allow-IstioMesh --priority 1004 --direction Inbound --access Allow --protocol Tcp --source-address-prefixes '*' --destination-port-ranges 15000-15090 --destination-address-prefixes '*' --description "Allow Istio Mesh Ports" &> /dev/null
+
+    print_status "NSG rules created for ports 22, 8080, 443, 15000-15090 on VM ($NSG_NAME)"
 }
 
 # Install Istio on the cluster
@@ -1023,13 +1035,13 @@ get_connection_info() {
     echo "  Sample Apps: ls -la $ISTIO_DIR/samples/"
     echo ""
     echo "Next Steps:"
-    echo "  1. Start Port Forwarding: ./setup-istio.sh port-forward"
-    echo "  2. Test HelloWorld: curl http://localhost:8080/hello"
-    echo "  3. View Kiali dashboard for service mesh topology: http://localhost:20001"
-    echo "  4. Deploy additional sample applications: ./setup-istio.sh deploy-samples"
-    echo "  5. Set up VM mesh integration: ./setup-istio.sh setup-vm-mesh"
-    echo "  6. Test mesh integration: ./setup-istio.sh deploy-mesh-test"
+    echo "  1. Deploy optionally additional sample applications: ./setup-istio.sh deploy-samples"
+    echo "  2. Set up VM mesh integration: ./setup-istio.sh setup-vm-mesh"
+    echo "  3. Test mesh integration: ./setup-istio.sh deploy-mesh-test"
     echo "     then: ./setup-istio.sh test-mesh"
+    echo "  4. Start Port Forwarding: ./setup-istio.sh port-forward"
+    echo "  5. Test HelloWorld: curl http://localhost:8080/hello"
+    echo "  3. View Kiali dashboard for service mesh topology: http://localhost:20001"
     echo "  7. Stop Port Forwarding: ./setup-istio.sh port-forward stop"
     echo "  8. Clean up resources when done: ./setup-istio.sh cleanup"
     echo "     then optionally: ./setup-istio.sh cleanup local"

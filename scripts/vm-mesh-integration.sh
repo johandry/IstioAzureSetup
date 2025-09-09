@@ -159,6 +159,8 @@ metadata:
 spec:
   hosts:
   - $VM_APP.$VM_NAMESPACE.svc.cluster.local
+  gateways:
+  - mesh
   http:
   - match:
     - uri:
