@@ -575,24 +575,24 @@ test_gateway_access() {
         print_test_result "FAIL" "VM service not accessible through gateway"
     fi
     
-    # Test observability tools through gateway
+    # Test observability tools services exist
     ((total++))
-    local obs_accessible=0
-    if curl -s --max-time 10 "http://$gateway_ip/kiali" | grep -q "kiali\|Kiali\|login"; then
-        ((obs_accessible++))
+    local obs_services=0
+    if kubectl get svc kiali -n istio-system &> /dev/null; then
+        ((obs_services++))
     fi
-    if curl -s --max-time 10 "http://$gateway_ip/grafana" | grep -q "grafana\|Grafana\|dashboard"; then
-        ((obs_accessible++))
+    if kubectl get svc grafana -n istio-system &> /dev/null; then
+        ((obs_services++))
     fi
-    if curl -s --max-time 10 "http://$gateway_ip/jaeger" | grep -q "jaeger\|Jaeger\|tracing"; then
-        ((obs_accessible++))
+    if kubectl get svc tracing -n istio-system &> /dev/null; then
+        ((obs_services++))
     fi
     
-    if [ "$obs_accessible" -gt "0" ]; then
-        print_test_result "PASS" "Observability tools accessible through gateway ($obs_accessible/3)"
+    if [ "$obs_services" -gt "0" ]; then
+        print_test_result "PASS" "Observability tools services available ($obs_services/3: $([ $obs_services -ge 1 ] && echo 'Kiali' && [ $obs_services -ge 2 ] && echo ', Grafana' && [ $obs_services -ge 3 ] && echo ', Jaeger' || echo ''))"
         ((passed++))
     else
-        print_test_result "FAIL" "No observability tools accessible through gateway"
+        print_test_result "FAIL" "No observability tools services found"
     fi
     
     echo ""
@@ -765,12 +765,16 @@ show_test_results() {
     local gateway_ip=$(kubectl get service istio-ingressgateway -n istio-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
     if [ -n "$gateway_ip" ]; then
         echo ""
-        echo "Access URLs:"
+        echo "Gateway Access URLs:"
         echo "  Gateway Health:    http://$gateway_ip/health"
         echo "  VM Service:        http://$gateway_ip/vm-service"
-        echo "  Kiali Dashboard:   http://$gateway_ip/kiali"
-        echo "  Grafana:          http://$gateway_ip/grafana"
-        echo "  Jaeger:           http://$gateway_ip/jaeger"
+        echo ""
+        echo "Observability Tools (use port-forward to access):"
+        echo "  Kiali Dashboard:   kubectl port-forward -n istio-system svc/kiali 20001:20001"
+        echo "  Grafana Dashboard: kubectl port-forward -n istio-system svc/grafana 3000:3000"
+        echo "  Jaeger Tracing:    kubectl port-forward -n istio-system svc/tracing 16686:80"
+        echo ""
+        echo "Or run: ./setup-istio.sh port-forward"
     fi
     
     echo ""

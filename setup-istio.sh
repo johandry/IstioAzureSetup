@@ -1130,47 +1130,121 @@ setup_port_forwarding() {
         kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null | grep -q "Running"
     }
     
+    # Function to start port forwarding with retry logic
+    start_port_forward_with_retry() {
+        local namespace=$1
+        local service=$2
+        local local_port=$3
+        local remote_port=$4
+        local description=$5
+        local max_retries=3
+        local retry_count=0
+        local success=false
+        
+        if check_service "$namespace" "$service"; then
+            if check_port "$local_port"; then
+                print_status "Starting port-forward for $description (with retry)..."
+                
+                # For VM services, show endpoint information for debugging
+                if [[ "$description" == *"VM"* ]]; then
+                    local endpoints=$(kubectl get endpoints "$service" -n "$namespace" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "none")
+                    print_status "VM service endpoints: $endpoints"
+                    if [ "$endpoints" = "none" ]; then
+                        print_warning "No endpoints found for VM service - VM may not be connected to mesh"
+                        return 1
+                    fi
+                fi
+                
+                while [ $retry_count -lt $max_retries ] && [ "$success" = false ]; do
+                    retry_count=$((retry_count + 1))
+                    if [ $retry_count -gt 1 ]; then
+                        print_status "Retry attempt $retry_count/$max_retries for $description..."
+                        sleep 3  # Longer delay for VM services
+                    fi
+                    
+                    kubectl port-forward -n "$namespace" svc/"$service" "$local_port:$remote_port" &> /dev/null &
+                    local pid=$!
+                    sleep 3  # Give more time for VM connection to establish
+                    
+                    # Verify the process is still running
+                    if kill -0 "$pid" 2>/dev/null; then
+                        # Test if port forwarding is actually working
+                        if timeout 10 bash -c "echo > /dev/tcp/localhost/$local_port" 2>/dev/null; then
+                            success=true
+                            PIDS+=($pid)
+                            SERVICES+=("$description")
+                            if [ $retry_count -eq 1 ]; then
+                                echo "  ✓ $description: http://localhost:$local_port (PID: $pid)"
+                            else
+                                echo "  ✓ $description: http://localhost:$local_port (PID: $pid) - succeeded on attempt $retry_count"
+                                print_warning "$description port forwarding required $retry_count attempts - connection may be unstable"
+                            fi
+                        else
+                            # Port forwarding failed, kill the process and retry
+                            kill "$pid" 2>/dev/null || true
+                            if [ $retry_count -lt $max_retries ]; then
+                                if [[ "$description" == *"VM"* ]]; then
+                                    print_warning "VM service connection test failed, retrying... (VM services may take longer to respond)"
+                                else
+                                    print_warning "Port forwarding test failed for $description, retrying..."
+                                fi
+                            fi
+                        fi
+                    else
+                        if [ $retry_count -lt $max_retries ]; then
+                            print_warning "Port forwarding process failed to start for $description, retrying..."
+                        fi
+                    fi
+                done
+                
+                if [ "$success" = false ]; then
+                    print_warning "Port forwarding for $description failed after $max_retries attempts"
+                    if [[ "$description" == *"VM"* ]]; then
+                        print_status "VM service troubleshooting tips:"
+                        print_status "  1. Check if VM is running: az vm show -d -g $RESOURCE_GROUP -n $VM_NAME --query powerState"
+                        print_status "  2. Check VM mesh integration: kubectl get workloadentry -n $namespace"
+                        print_status "  3. Test VM connectivity: ssh azureuser@\$(VM_IP) 'curl -s localhost:8080'"
+                        print_status "  4. Check service endpoints: kubectl get endpoints $service -n $namespace"
+                    fi
+                fi
+            else
+                print_warning "Port $local_port is already in use, skipping $description"
+            fi
+        else
+            print_warning "Service $service not found in namespace $namespace, skipping $description"
+        fi
+    }
+    
     # Start port forwarding for Istio add-ons
     echo ""
     echo "Istio Add-ons:"
     start_port_forward "istio-system" "kiali" "20001" "20001" "Kiali Dashboard"
     start_port_forward "istio-system" "grafana" "3000" "3000" "Grafana Dashboard" 
-    start_port_forward "istio-system" "jaeger" "16686" "16686" "Jaeger Tracing"
+    start_port_forward "istio-system" "tracing" "16686" "80" "Jaeger Tracing"
     start_port_forward "istio-system" "prometheus" "9090" "9090" "Prometheus"
     
-    # Start port forwarding for HelloWorld app
+    # Start port forwarding for HelloWorld app with retry logic
     echo ""
     echo "Applications:"
-    if check_deployment "default" "app=helloworld"; then
-        if check_port "8080"; then
-            print_status "Starting port-forward for HelloWorld app..."
-            kubectl port-forward -n default svc/helloworld "8080:5000" &> /dev/null &
-            local helloworld_pid=$!
-            PIDS+=($helloworld_pid)
-            SERVICES+=("HelloWorld App")
-            echo "  ✓ HelloWorld App: http://localhost:8080/hello (PID: $helloworld_pid)"
-            sleep 1
-        else
-            print_warning "Port 8080 is already in use, trying alternative port 8082..."
-            if check_port "8082"; then
-                kubectl port-forward -n default svc/helloworld "8082:5000" &> /dev/null &
-                local helloworld_pid=$!
-                PIDS+=($helloworld_pid)
-                SERVICES+=("HelloWorld App")
-                echo "  ✓ HelloWorld App: http://localhost:8082/hello (PID: $helloworld_pid)"
-            else
-                print_warning "Both ports 8080 and 8082 are in use, skipping HelloWorld"
-            fi
+    if check_service "helloworld" "helloworld"; then
+        start_port_forward_with_retry "helloworld" "helloworld" "8080" "5000" "HelloWorld App"
+        # If 8080 failed, try alternative port
+        if ! pgrep -f "kubectl port-forward.*helloworld.*8080" > /dev/null; then
+            print_status "Port 8080 failed, trying alternative port 8082..."
+            start_port_forward_with_retry "helloworld" "helloworld" "8082" "5000" "HelloWorld App (alt port)"
         fi
     else
-        print_warning "HelloWorld deployment not found, skipping"
+        print_warning "HelloWorld service not found in helloworld namespace, skipping"
     fi
     
-    # Start port forwarding for VM web service (if deployed)
+    # Start port forwarding for VM web service (if deployed) with retry logic
     if check_service "vm-workloads" "vm-web-service"; then
-        start_port_forward "vm-workloads" "vm-web-service" "8081" "8080" "VM Web Service"
+        print_status "Found VM web service, attempting port forwarding with retry logic..."
+        start_port_forward_with_retry "vm-workloads" "vm-web-service" "8081" "8080" "VM Web Service"
     else
         print_warning "VM Web Service not found in vm-workloads namespace, skipping"
+        print_status "Note: VM web service requires VM mesh integration to be set up first"
+        print_status "Run: ./setup-istio.sh setup-vm-mesh to configure VM mesh integration"
     fi
     
     echo ""
