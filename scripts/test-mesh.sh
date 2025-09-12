@@ -412,13 +412,29 @@ test_connectivity() {
                 # Check if VM has Istio proxy/sidecar for mTLS
                 local vm_mtls_check=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 azureuser@$vm_ip "ss -tulpn | grep :15001" 2>/dev/null || echo "")
                 if [ -n "$vm_mtls_check" ]; then
-                    # VM has Istio proxy, check mTLS policy
-                    local mtls_policy=$($istioctl_path authn tls-check deployment/sleep.mesh-test helloworld.helloworld.svc.cluster.local 2>/dev/null | grep -i "mtls\|tls" || echo "")
-                    if echo "$mtls_policy" | grep -q -i "mtls\|permissive\|strict"; then
-                        print_test_result "PASS" "VM to HelloWorld connection uses mTLS encryption"
-                        ((passed++))
+                    # VM has Istio proxy, check mTLS by examining cluster config
+                    local sleep_pod=$(kubectl get pods -n mesh-test -l app=sleep --no-headers -o custom-columns=":metadata.name" | head -1)
+                    if [ -n "$sleep_pod" ]; then
+                        # Check outbound cluster configuration for HelloWorld service TLS
+                        local cluster_config=$($istioctl_path proxy-config cluster "$sleep_pod.mesh-test" --fqdn helloworld.helloworld.svc.cluster.local -o json 2>/dev/null | grep -i "transport_socket\|tls_context" || echo "")
+                        if [ -n "$cluster_config" ]; then
+                            print_test_result "PASS" "VM to HelloWorld connection has mTLS transport configured"
+                            ((passed++))
+                        else
+                            print_test_result "FAIL" "VM to HelloWorld connection does not have mTLS transport configured"
+                        fi
+                        
+                        # Additional check: verify service exists in mesh
+                        ((total++))
+                        local helloworld_cluster=$($istioctl_path proxy-config cluster "$sleep_pod.mesh-test" | grep "helloworld.helloworld.svc.cluster.local" || echo "")
+                        if [ -n "$helloworld_cluster" ]; then
+                            print_test_result "PASS" "VM to HelloWorld connection exists in service mesh"
+                            ((passed++))
+                        else
+                            print_test_result "FAIL" "VM to HelloWorld connection not found in service mesh configuration"
+                        fi
                     else
-                        print_test_result "FAIL" "VM to HelloWorld connection does not use mTLS encryption"
+                        print_test_result "FAIL" "Cannot find sleep pod to check mTLS configuration"
                     fi
                 else
                     print_test_result "FAIL" "VM does not have Istio proxy for mTLS (port 15001 not found)"
@@ -501,20 +517,33 @@ test_connectivity() {
             # Test mTLS encryption from HelloWorld to VM
             ((total++))
             if [ -n "$istioctl_path" ]; then
-                # Check mTLS policy for HelloWorld to VM communication
-                local vm_mtls_policy=$($istioctl_path authn tls-check $helloworld_pod.helloworld $VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local 2>/dev/null | grep -i "mtls\|tls" || echo "")
-                if echo "$vm_mtls_policy" | grep -q -i "mtls\|permissive\|strict"; then
-                    print_test_result "PASS" "HelloWorld to VM connection uses mTLS encryption"
+                # Check mTLS policy for HelloWorld to VM communication using cluster config
+                local vm_cluster_config=$($istioctl_path proxy-config cluster $helloworld_pod.helloworld --fqdn $VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local -o json 2>/dev/null | grep -i "transport_socket\|tls_context" || echo "")
+                if [ -n "$vm_cluster_config" ]; then
+                    print_test_result "PASS" "HelloWorld to VM connection has mTLS transport configured"
                     ((passed++))
                 else
-                    # Alternative check: look for Envoy proxy logs showing TLS
-                    local proxy_logs=$(kubectl logs $helloworld_pod -n helloworld -c istio-proxy --tail=50 2>/dev/null | grep -i "tls\|ssl" | head -1 || echo "")
-                    if [ -n "$proxy_logs" ]; then
-                        print_test_result "PASS" "HelloWorld to VM connection shows TLS activity in proxy logs"
-                        ((passed++))
-                    else
-                        print_test_result "FAIL" "HelloWorld to VM connection does not show mTLS encryption"
-                    fi
+                    print_test_result "FAIL" "HelloWorld to VM connection does not have mTLS transport configured"
+                fi
+                
+                # Additional check: verify VM service exists in HelloWorld's cluster config
+                ((total++))
+                local vm_service_cluster=$($istioctl_path proxy-config cluster $helloworld_pod.helloworld | grep "$VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local" || echo "")
+                if [ -n "$vm_service_cluster" ]; then
+                    print_test_result "PASS" "HelloWorld to VM connection exists in service mesh"
+                    ((passed++))
+                else
+                    print_test_result "FAIL" "HelloWorld to VM connection not found in service mesh configuration"
+                fi
+                
+                # Additional check: look for Envoy proxy logs showing TLS activity
+                ((total++))
+                local proxy_logs=$(kubectl logs $helloworld_pod -n helloworld -c istio-proxy --tail=50 2>/dev/null | grep -i "tls\|ssl" | head -1 || echo "")
+                if [ -n "$proxy_logs" ]; then
+                    print_test_result "PASS" "HelloWorld to VM connection shows TLS activity in proxy logs"
+                    ((passed++))
+                else
+                    print_test_result "FAIL" "HelloWorld to VM connection shows no TLS activity in proxy logs"
                 fi
             else
                 print_test_result "FAIL" "istioctl not found, cannot verify HelloWorld to VM mTLS encryption"
@@ -665,12 +694,22 @@ test_istio_configuration() {
         fi
         
         if [ -n "$istioctl_path" ]; then
-            local mtls_status=$($istioctl_path authn tls-check 2>/dev/null | grep -i "permissive\|strict" | head -1 || echo "")
+            # Check for TLS transport configuration in cluster config
+            local mtls_status=$($istioctl_path proxy-config cluster deployment/sleep.mesh-test -o json 2>/dev/null | grep -i "transport_socket\|tls_context" | head -1 || echo "")
             if [ -n "$mtls_status" ]; then
-                print_test_result "PASS" "Default mTLS is enabled (Istio default behavior)"
+                print_test_result "PASS" "Default mTLS is enabled (TLS transport found in cluster config)"
                 ((passed++))
             else
-                print_test_result "FAIL" "No explicit mTLS policies found and cannot verify default mTLS"
+                # Check PeerAuthentication default policy
+                local default_pa=$(kubectl get peerauthentication default -n istio-system -o jsonpath='{.spec.mtls.mode}' 2>/dev/null || echo "")
+                if [ "$default_pa" = "STRICT" ]; then
+                    print_test_result "PASS" "Default mTLS is configured in STRICT mode"
+                    ((passed++))
+                elif [ -z "$default_pa" ]; then
+                    print_test_result "FAIL" "No explicit mTLS policy found (Istio default is PERMISSIVE, not STRICT)"
+                else
+                    print_test_result "FAIL" "Default mTLS mode is $default_pa (should be STRICT)"
+                fi
             fi
         else
             print_test_result "FAIL" "No explicit mTLS policies found and istioctl not available for verification"
@@ -752,7 +791,8 @@ show_test_results() {
         echo "   kubectl get pods,svc -n helloworld"
         echo ""
         echo "9. Check mTLS configuration:"
-        echo "   istioctl authn tls-check"
+        echo "   istioctl proxy-config cluster \$(kubectl get pods -n mesh-test -l app=sleep -o name | cut -d/ -f2).mesh-test --fqdn helloworld.helloworld.svc.cluster.local"
+        echo "   istioctl proxy-config cluster \$(kubectl get pods -n helloworld -l app=helloworld -o name | head -1 | cut -d/ -f2).helloworld --fqdn $VM_SERVICE_NAME.$VM_NAMESPACE.svc.cluster.local"
         echo "   kubectl get peerauthentication,authorizationpolicy --all-namespaces"
         echo ""
         echo "10. Verify VM has Istio proxy for mTLS:"

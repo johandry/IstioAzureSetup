@@ -637,6 +637,20 @@ EOF
         print_status "Istio installed successfully on AKS cluster"
     fi
     
+    # Configure mesh-wide strict mTLS policy
+    print_status "Configuring mesh-wide strict mTLS policy..."
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+EOF
+    print_status "Mesh-wide strict mTLS policy configured"
+    
     # Label default namespace for Istio injection (idempotent)
     kubectl label namespace default istio-injection=enabled --overwrite
     
