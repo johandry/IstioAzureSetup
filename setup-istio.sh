@@ -743,7 +743,6 @@ spec:
   - "*"
   gateways:
   - helloworld-gateway
-  - istio-system/istio-gateway
   http:
   - match:
     - uri:
@@ -793,6 +792,32 @@ spec:
     labels:
       version: v2
 EOF
+    
+    # Create basic AuthorizationPolicy for HelloWorld services (VM policies added later)
+    print_status "Creating basic AuthorizationPolicy for HelloWorld services..."
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: helloworld-policy
+  namespace: helloworld
+spec:
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/helloworld/sa/default"]
+    - source:
+        principals: ["cluster.local/ns/mesh-test/sa/sleep"]
+    - source:
+        namespaces: ["istio-system"]
+  - to:
+    - operation:
+        methods: ["GET", "POST", "HEAD"]
+        paths: ["/hello", "/"]
+EOF
+    
+    print_status "✓ Basic AuthorizationPolicy for HelloWorld created"
     
     print_status "✅ HelloWorld sample application deployed successfully!"
     

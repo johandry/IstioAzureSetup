@@ -308,6 +308,26 @@ EOF
 configure_test_gateway() {
     print_status "Configuring gateway for test services..."
     
+    # Create Gateway for mesh-test services
+    print_status "Configuring mesh-test gateway..."
+    kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: mesh-test-gateway
+  namespace: mesh-test
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+EOF
+    
     # Delete existing VirtualService if it exists
     kubectl delete virtualservice test-services -n mesh-test --ignore-not-found=true
     
@@ -321,7 +341,7 @@ spec:
   hosts:
   - "*"
   gateways:
-  - istio-system/istio-gateway
+  - mesh-test-gateway
   http:
   - match:
     - uri:
@@ -354,6 +374,54 @@ spec:
 EOF
     
     print_status "Test gateway configuration applied"
+    
+    # Create AuthorizationPolicy for mesh-test services
+    print_status "Creating AuthorizationPolicy for mesh-test services..."
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: mesh-test-policy
+  namespace: mesh-test
+spec:
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/mesh-test/sa/sleep"]
+    - source:
+        principals: ["cluster.local/ns/mesh-test/sa/httpbin"]
+    - source:
+        principals: ["cluster.local/ns/vm-workloads/sa/vm-workload"]
+    - source:
+        principals: ["cluster.local/ns/helloworld/sa/default"]
+    - source:
+        namespaces: ["istio-system"]
+  - to:
+    - operation:
+        methods: ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]
+EOF
+    
+    # Create AuthorizationPolicy for cross-namespace communication
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: cross-namespace-policy
+  namespace: mesh-test
+spec:
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        namespaces: ["vm-workloads", "helloworld", "mesh-test", "istio-system"]
+  - to:
+    - operation:
+        methods: ["GET", "POST"]
+        paths: ["/", "/httpbin", "/headers", "/vm-test"]
+EOF
+    
+    print_status "✓ AuthorizationPolicy configurations created"
 }
 
 # Validate deployments

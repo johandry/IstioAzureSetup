@@ -85,6 +85,17 @@ metadata:
 automountServiceAccountToken: true
 EOF
     
+    # Wait for ServiceAccount to be ready
+    print_status "Waiting for ServiceAccount to be ready..."
+    kubectl wait --for=condition=Ready serviceaccount/$SERVICE_ACCOUNT -n $VM_NAMESPACE --timeout=30s || true
+    
+    # Verify ServiceAccount exists before proceeding
+    if ! kubectl get serviceaccount $SERVICE_ACCOUNT -n $VM_NAMESPACE &> /dev/null; then
+        print_error "ServiceAccount $SERVICE_ACCOUNT not found in namespace $VM_NAMESPACE"
+        exit 1
+    fi
+    print_status "✓ ServiceAccount $SERVICE_ACCOUNT is ready"
+    
     # Create workload group with Azure network considerations
     cat > "$WORK_DIR/vm-files/workloadgroup.yaml" <<EOF
 apiVersion: networking.istio.io/v1
@@ -117,6 +128,97 @@ spec:
 EOF
 
     kubectl apply -f "$WORK_DIR/vm-files/workloadgroup.yaml"
+    
+    # Verify WorkloadGroup was created successfully
+    if kubectl get workloadgroup $VM_APP -n $VM_NAMESPACE &> /dev/null; then
+        print_status "✓ WorkloadGroup $VM_APP created successfully in namespace $VM_NAMESPACE"
+        
+        # Validate ServiceAccount reference in WorkloadGroup
+        local sa_in_wg=$(kubectl get workloadgroup $VM_APP -n $VM_NAMESPACE -o jsonpath='{.spec.template.serviceAccount}' 2>/dev/null || echo "")
+        if [ "$sa_in_wg" = "$SERVICE_ACCOUNT" ]; then
+            print_status "✓ WorkloadGroup correctly references ServiceAccount: $SERVICE_ACCOUNT"
+        else
+            print_warning "⚠ WorkloadGroup ServiceAccount reference mismatch: expected $SERVICE_ACCOUNT, found '$sa_in_wg'"
+        fi
+    else
+        print_error "Failed to create WorkloadGroup $VM_APP"
+        exit 1
+    fi
+    
+    # Create AuthorizationPolicy for VM workload
+    print_status "Creating AuthorizationPolicy for VM workload..."
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: vm-workload-policy
+  namespace: $VM_NAMESPACE
+spec:
+  selector:
+    matchLabels:
+      app: $VM_APP
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/$VM_NAMESPACE/sa/$SERVICE_ACCOUNT"]
+    - source:
+        principals: ["cluster.local/ns/mesh-test/sa/sleep"]
+    - source:
+        principals: ["cluster.local/ns/helloworld/sa/default"]
+  - to:
+    - operation:
+        methods: ["GET", "POST", "PUT", "DELETE"]
+        paths: ["/*"]
+EOF
+    
+    # Create AuthorizationPolicy to allow VM workload to access other services
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: vm-outbound-policy
+  namespace: $VM_NAMESPACE
+spec:
+  selector:
+    matchLabels:
+      app: $VM_APP
+  action: ALLOW
+  rules:
+  - to:
+    - operation:
+        methods: ["GET", "POST"]
+EOF
+    
+    print_status "✓ AuthorizationPolicy configurations created"
+    
+    # Update HelloWorld AuthorizationPolicy to include VM workload access
+    print_status "Updating HelloWorld AuthorizationPolicy to include VM access..."
+    kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: helloworld-policy
+  namespace: helloworld
+spec:
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/helloworld/sa/default"]
+    - source:
+        principals: ["cluster.local/ns/mesh-test/sa/sleep"]
+    - source:
+        principals: ["cluster.local/ns/vm-workloads/sa/vm-workload"]
+    - source:
+        namespaces: ["istio-system"]
+  - to:
+    - operation:
+        methods: ["GET", "POST", "HEAD"]
+        paths: ["/hello", "/"]
+EOF
+    
+    print_status "✓ HelloWorld AuthorizationPolicy updated with VM access"
 
     print_status "✓ Cluster resources configured with Azure optimizations"
 }
