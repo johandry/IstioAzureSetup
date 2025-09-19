@@ -4,6 +4,8 @@ This document provides comprehensive instructions for setting up Azure VMs as pa
 
 **Multi-VM Support**: This guide supports both single VM deployments and scenarios with multiple VMs being created, terminated, and recreated simultaneously. The architecture separates shared cluster resources from VM-specific resources to enable efficient scaling and lifecycle management.
 
+📊 **Visual Flow Diagram**: For a comprehensive visual representation of all the processes and decision points described in this document, see the [VM Mesh Integration Flow Diagram](VM-Mesh-Integration-Flow-Diagram.md).
+
 ## Part 1: Cluster-Side VM Mesh Integration Setup
 
 Before creating the VM with CloudInit, you must first configure the Kubernetes cluster to support VM mesh integration and generate the required certificates and configuration files.
