@@ -1,0 +1,39 @@
+environment: "development"
+log_level: "info"
+
+azure:
+  subscription_id: "${AZURE_SUBSCRIPTION_ID}"
+  tenant_id: "${AZURE_TENANT_ID}"
+  client_id: "${AZURE_CLIENT_ID}"
+  client_secret: "${AZURE_CLIENT_SECRET}"
+  location: "East US"
+  resource_group_name: "istio-vm-mesh-rg"
+
+kubernetes:
+  config_path: "${KUBECONFIG}"
+  context: ""  # Use default context if empty
+  namespace: "istio-system"
+
+istio:
+  mesh_id: "cluster.local"
+  network: "vm-network"
+  cluster_name: "Kubernetes"
+  namespace: "istio-system"
+
+vm:
+  default_size: "Standard_B2s"
+  default_image:
+    publisher: "Canonical"
+    offer: "0001-com-ubuntu-server-focal"
+    sku: "20_04-lts-gen2"
+    version: "latest"
+  default_networking:
+    vnet_name: "istio-vm-vnet"
+    subnet_name: "vm-subnet"
+    security_group_name: "istio-vm-nsg"
+    public_ip_enabled: true
+  cloud_init_template_path: "/app/templates/cloud-init-istio-vm.yaml"
+  tags:
+    project: "istio-vm-mesh"
+    environment: "development"
+    managed_by: "vm-manager"
