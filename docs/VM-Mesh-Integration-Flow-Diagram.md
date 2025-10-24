@@ -8,8 +8,8 @@ This document provides visual flow diagrams for the VM Mesh Integration process,
 flowchart TD
     A[Start: VM Mesh Integration] --> B[Prerequisites Check]
     B --> E[Part 1: Cluster-Side Setup]
-    E --> F[Part 2: VM Creation with CloudInit]
-    F --> G[Part 3: Post-VM Configuration]
+    E --> F[Part 2: Salt Image Build & VM Creation]
+    F --> G[Part 3: Boot-Time Auto-Configuration]
     G --> H[Verification & Testing]
     H --> I[End: VMs Ready in Mesh]
     
@@ -64,37 +64,42 @@ flowchart TD
     style G1 fill:#c8e6c9
 ```
 
-## Part 2: VM Creation and CloudInit Process
+## Part 2: Salt Image Build and VM Creation Process
 
 ```mermaid
 flowchart TD
-    A2[Part 2: VM Creation] --> B2[Create the VM with CloudInit]
-    B2 --> C2[Deploy VM with CloudInit YAML]
+    A2[Part 2: Salt Configuration] --> B2[Phase 1: Image Build]
+    B2 --> C2[Execute image-build.sls]
 
-    C2 --> E2[CloudInit Process Execution]
+    C2 --> E2[Salt Image Build Execution]
     E2 --> E2a[Package Installation]
     E2 --> E2b[Directory Creation]
     E2 --> E2c[Script File Creation]
     E2 --> E2d[Firewall Configuration]
     E2 --> E2e[Istio Installation]
     
-    E2a --> F2[VM Basic Setup Complete]
+    E2a --> F2[Create VM Image Snapshot]
     E2b --> F2
     E2c --> F2
     E2d --> F2
     E2e --> F2
     
-    F2 --> G2[Ready for Post-VM Configuration]
+    F2 --> G2[Phase 2: Deploy VMs from Image]
+    G2 --> H2[VMs Boot with boot-time.sls]
+    H2 --> I2[Auto-Detect Certificates]
+    I2 --> J2[Auto-Configure Mesh Integration]
+    J2 --> K2[VMs Ready in Mesh]
     
     style A2 fill:#e8f5e8
-    style G2 fill:#c8e6c9
+    style F2 fill:#ffeb3b
+    style K2 fill:#c8e6c9
 ```
 
-## Part 3: Post-VM Configuration
+## Part 3: Certificate Transfer and WorkloadEntry Creation
 
 ```mermaid
 flowchart TD
-    A3[Part 3: Post-VM Configuration] --> B3[Get VM IP Address]
+    A3[Part 3: Finalize Mesh Integration] --> B3[Get VM IP Addresses]
 
     B3 --> E3[Transfer Configuration Files]
     E3 --> E3a[SSH to VMs]
@@ -107,7 +112,7 @@ flowchart TD
     
     F3 --> F3a[Create WorkloadEntry for each VM]
 
-    F3a --> G3[Complete Mesh Setup on VMs]
+    F3a --> G3[Salt Auto-Configures Mesh Integration]
     G3 --> G3a[SSH to VMs]
     G3 --> G3b[Run complete-mesh-setup script]
     
@@ -366,14 +371,18 @@ flowchart TD
 
 ## Summary
 
-This flow diagram represents the complete VM Mesh Integration process with the following key phases:
+This flow diagram represents the complete VM Mesh Integration process using Salt with the following key phases:
 
 1. **Cluster-Side Setup**: Configure Kubernetes cluster resources for VM integration
-2. **VM Creation**: Deploy VMs with CloudInit configuration
-3. **Post-VM Configuration**: Transfer certificates and create WorkloadEntries
-4. **Verification**: Test connectivity and mesh integration
-5. **Lifecycle Management**: Handle VM termination, creation, and scaling
-6. **Error Handling**: Troubleshoot and recover from issues
-7. **Automation**: Use scripts for bulk operations and scaling
+2. **Salt Image Build**: Create VM image with Salt configuration (one-time)
+3. **VM Deployment**: Deploy VMs from Salt-configured image
+4. **Auto-Configuration**: Salt automatically configures mesh integration at boot
+5. **Certificate Transfer**: Transfer certificates and create WorkloadEntries
+6. **Verification**: Test connectivity and mesh integration
+7. **Lifecycle Management**: Handle VM termination, creation, and scaling
+8. **Error Handling**: Troubleshoot and recover from issues
+9. **Automation**: Use scripts for bulk operations and scaling
+10. **Error Handling**: Troubleshoot and recover from issues
+11. **Automation**: Use scripts for bulk operations and scaling
 
 The diagrams support both single VM and multiple VM scenarios, with specific flows for complex operations like blue-green deployments, auto-scaling, and mixed create/terminate operations.
