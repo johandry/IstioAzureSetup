@@ -1,0 +1,636 @@
+#cloud-config
+# Enhanced CloudInit configuration for Istio mesh-ready Azure VM
+# This configuration prepares a VM for Istio service mesh integration
+# Compatible with Ubuntu 22.04 LTS
+
+# System updates and upgrades
+package_update: true
+package_upgrade: true
+
+# Install essential packages for Istio mesh integration
+packages:
+  - curl
+  - wget
+  - unzip
+  - systemd
+  - iptables
+  - ufw
+  - python3
+  - python3-pip
+  - python3-flask
+  - jq
+  - net-tools
+  - dnsutils
+  - ca-certificates
+  - apt-transport-https
+  - software-properties-common
+  - gnupg
+  - lsb-release
+
+# System configuration
+bootcmd:
+  # Ensure networking is properly configured
+  - systemctl enable systemd-networkd
+  - systemctl start systemd-networkd
+
+# Create necessary users and groups for Istio
+groups:
+  - istio-proxy
+
+users:
+  - name: istio-proxy
+    groups: istio-proxy
+    system: true
+    shell: /bin/false
+    home: /var/lib/istio
+    create_home: false
+
+# Create directory structure for Istio and applications
+runcmd:
+  # Create Istio directories with proper permissions
+  - mkdir -p /etc/certs
+  - mkdir -p /var/run/secrets/tokens
+  - mkdir -p /var/run/secrets/istio/
+  - mkdir -p /etc/istio/proxy
+  - mkdir -p /etc/istio/config
+  - mkdir -p /var/lib/istio/envoy
+  - mkdir -p /etc/istio
+  - mkdir -p /home/azureuser/istio-vm-setup
+  - mkdir -p /home/azureuser/vm-service
+  - mkdir -p /home/azureuser/.local/bin
+  
+  # Set proper ownership for Istio directories
+  - chown -R istio-proxy:istio-proxy /etc/certs /var/run/secrets /var/lib/istio /etc/istio/proxy /etc/istio/config
+  - chmod 755 /etc/certs /var/run/secrets/istio /var/lib/istio/envoy /etc/istio/config
+  - chmod 750 /var/run/secrets/tokens
+  
+  # Configure firewall for Istio mesh
+  - ufw --force enable
+  - ufw allow 22/tcp comment 'SSH management'
+  - ufw allow 8080/tcp comment 'VM web service'
+  - ufw allow 15000:15090/tcp comment 'Istio sidecar ports'
+  - ufw allow out 15012/tcp comment 'Istio discovery'
+  - ufw allow out 443/tcp comment 'HTTPS outbound'
+  - ufw allow out 53/tcp comment 'DNS TCP'
+  - ufw allow out 53/udp comment 'DNS UDP'
+  
+  # Install Istio sidecar
+  - sudo -u azureuser /home/azureuser/install-istio.sh
+  
+  # Install Python dependencies for the sample application
+  - pip3 install flask requests
+  
+  # Create systemd service for the VM web application
+  - systemctl daemon-reload
+  - systemctl enable vm-web-service.service
+  
+  # Set ownership for azureuser home directory
+  - chown -R azureuser:azureuser /home/azureuser/
+  
+  # Ensure proper permissions for scripts
+  - chmod +x /home/azureuser/*.sh
+
+# Configuration files
+write_files:
+  # Comprehensive health check script
+  - path: /home/azureuser/check-service.sh
+    permissions: '0755'
+    owner: azureuser:azureuser
+    content: |
+      #!/bin/bash
+      # Comprehensive health check script for Istio VM integration
+
+      set -euo pipefail
+
+      # Color codes for output
+      RED='\033[0;31m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[1;33m'
+      NC='\033[0m' # No Color
+
+      print_status() {
+          echo -e "${GREEN}[INFO]${NC} $1"
+      }
+
+      print_error() {
+          echo -e "${RED}[ERROR]${NC} $1"
+      }
+
+      print_warning() {
+          echo -e "${YELLOW}[WARNING]${NC} $1"
+      }
+
+      # Initialize status variables
+      ISTIO_STATUS=1
+      ADMIN_STATUS=1
+      WEB_SERVICE_STATUS=1
+      NETWORK_STATUS=1
+
+      print_status "=== Istio VM Health Check ==="
+      echo ""
+
+      # Check Istio service
+      print_status "Checking Istio service..."
+      if systemctl is-active --quiet istio.service; then
+          print_status "✓ Istio service is running"
+          ISTIO_STATUS=0
+      else
+          print_error "✗ Istio service is not running"
+          systemctl status istio.service --no-pager -l || true
+      fi
+
+      # Check Istio admin endpoint
+      print_status "Checking Istio admin interface..."
+      if curl -s --connect-timeout 5 http://localhost:15000/stats/prometheus >/dev/null 2>&1; then
+          print_status "✓ Istio admin interface is accessible"
+          ADMIN_STATUS=0
+      else
+          print_warning "⚠ Istio admin interface is not accessible"
+      fi
+
+      # Check VM web service
+      print_status "Checking VM web service..."
+      if systemctl is-active --quiet vm-web-service.service; then
+          print_status "✓ VM web service is running"
+          if curl -s --connect-timeout 5 http://localhost:8080/health >/dev/null 2>&1; then
+              print_status "✓ VM web service health endpoint accessible"
+              WEB_SERVICE_STATUS=0
+          else
+              print_warning "⚠ VM web service health endpoint not accessible"
+          fi
+      else
+          print_error "✗ VM web service is not running"
+          systemctl status vm-web-service.service --no-pager -l || true
+      fi
+
+      # Check network connectivity
+      print_status "Checking network connectivity..."
+      if ping -c 1 8.8.8.8 >/dev/null 2>&1; then
+          print_status "✓ External network connectivity available"
+          NETWORK_STATUS=0
+      else
+          print_warning "⚠ External network connectivity issues"
+      fi
+
+      # Display comprehensive status
+      echo ""
+      print_status "=== Status Summary ==="
+      echo "Istio Service: $([ $ISTIO_STATUS -eq 0 ] && echo -e "${GREEN}✓ Running${NC}" || echo -e "${RED}✗ Stopped${NC}")"
+      echo "Istio Admin: $([ $ADMIN_STATUS -eq 0 ] && echo -e "${GREEN}✓ Available${NC}" || echo -e "${YELLOW}⚠ Unavailable${NC}")"
+      echo "Web Service: $([ $WEB_SERVICE_STATUS -eq 0 ] && echo -e "${GREEN}✓ Running${NC}" || echo -e "${RED}✗ Stopped${NC}")"
+      echo "Network: $([ $NETWORK_STATUS -eq 0 ] && echo -e "${GREEN}✓ Connected${NC}" || echo -e "${YELLOW}⚠ Issues${NC}")"
+
+      echo ""
+      if [ $ISTIO_STATUS -eq 0 ] && [ $WEB_SERVICE_STATUS -eq 0 ]; then
+          print_status "🎉 VM is ready for mesh integration!"
+          exit 0
+      else
+          print_error "❌ VM requires attention before mesh integration"
+          exit 1
+      fi
+
+  # Enhanced service status script
+  - path: /home/azureuser/service-status.sh
+    permissions: '0755'
+    owner: azureuser:azureuser
+    content: |
+      #!/bin/bash
+      # Detailed service status for troubleshooting
+
+      echo "=== Detailed Service Status ==="
+      echo ""
+
+      echo "--- Istio Service ---"
+      systemctl status istio.service --no-pager -l || echo "Istio service not found"
+
+      echo ""
+      echo "--- VM Web Service ---"
+      systemctl status vm-web-service.service --no-pager -l || echo "VM web service not found"
+
+      echo ""
+      echo "--- Recent System Logs ---"
+      echo "Istio service logs (last 10 lines):"
+      journalctl -u istio.service -n 10 --no-pager || echo "No Istio logs available"
+
+      echo ""
+      echo "VM web service logs (last 10 lines):"
+      journalctl -u vm-web-service.service -n 10 --no-pager || echo "No VM web service logs available"
+
+      echo ""
+      echo "--- Network Status ---"
+      echo "Active network interfaces:"
+      ip addr show | grep -E "(inet|UP|DOWN)"
+
+      echo ""
+      echo "--- Firewall Status ---"
+      ufw status verbose
+
+  # Istio installation script with enhanced error handling
+  - path: /home/azureuser/install-istio.sh
+    permissions: '0755'
+    owner: azureuser:azureuser
+    content: |
+      #!/bin/bash
+      # Enhanced Istio sidecar installation script
+
+      set -euo pipefail
+
+      # Color codes
+      RED='\033[0;31m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[1;33m'
+      NC='\033[0m'
+
+      print_status() {
+          echo -e "${GREEN}[INFO]${NC} $1"
+      }
+
+      print_error() {
+          echo -e "${RED}[ERROR]${NC} $1"
+      }
+
+      print_warning() {
+          echo -e "${YELLOW}[WARNING]${NC} $1"
+      }
+
+      ISTIO_VERSION="1.27.0"
+      DOWNLOAD_DIR="/tmp/istio-download"
+      MAX_RETRIES=3
+
+      # Check if already installed
+      if [ -f "/usr/local/bin/pilot-agent" ]; then
+          print_status "Checking existing Istio installation..."
+          if /usr/local/bin/pilot-agent version &>/dev/null; then
+              print_status "✓ Istio already installed and functional"
+              exit 0
+          else
+              print_warning "Existing installation corrupted, reinstalling..."
+              sudo rm -f /usr/local/bin/pilot-agent
+          fi
+      fi
+
+      # Create and clean download directory
+      mkdir -p "$DOWNLOAD_DIR"
+      cd "$DOWNLOAD_DIR"
+      rm -rf istio-* 2>/dev/null || true
+
+      print_status "Downloading Istio ${ISTIO_VERSION}..."
+
+      # Download with retries
+      for attempt in $(seq 1 $MAX_RETRIES); do
+          print_status "Download attempt $attempt of $MAX_RETRIES"
+          
+          if wget -q --timeout=60 --tries=1 "https://storage.googleapis.com/istio-release/releases/${ISTIO_VERSION}/deb/istio-sidecar.deb"; then
+              print_status "✓ Download successful"
+              break
+          elif [ $attempt -eq $MAX_RETRIES ]; then
+              print_error "Failed to download Istio after $MAX_RETRIES attempts"
+              exit 1
+          else
+              print_warning "Download attempt $attempt failed, retrying..."
+              sleep 5
+          fi
+      done
+
+      # Verify download
+      if [ ! -f "istio-sidecar.deb" ] || [ ! -s "istio-sidecar.deb" ]; then
+          print_error "Downloaded file is missing or empty"
+          exit 1
+      fi
+
+      print_status "Installing Istio sidecar..."
+
+      # Install with dependency resolution
+      if ! sudo dpkg -i istio-sidecar.deb; then
+          print_warning "dpkg installation failed, attempting to fix dependencies..."
+          sudo apt-get -f install -y
+          if ! sudo dpkg -i istio-sidecar.deb; then
+              print_error "Failed to install Istio package even after dependency fix"
+              exit 1
+          fi
+      fi
+
+      # Verify installation
+      if ! /usr/local/bin/pilot-agent version &>/dev/null; then
+          print_error "Installation verification failed"
+          exit 1
+      fi
+
+      print_status "✓ Istio ${ISTIO_VERSION} installed successfully"
+
+      # Cleanup
+      cd /home/azureuser
+      rm -rf "$DOWNLOAD_DIR"
+
+  # VM web service application
+  - path: /home/azureuser/vm-service/app.py
+    permissions: '0644'
+    owner: azureuser:azureuser
+    content: |
+      #!/usr/bin/env python3
+      """
+      Simple Flask web service for Istio mesh integration testing
+      Provides health checks, metrics, and service identification
+      """
+
+      import json
+      import os
+      import socket
+      import time
+      from datetime import datetime
+      from flask import Flask, jsonify, request
+
+      app = Flask(__name__)
+
+      # Service metadata
+      SERVICE_NAME = os.environ.get('SERVICE_NAME', 'vm-web-service')
+      SERVICE_VERSION = os.environ.get('SERVICE_VERSION', 'v1.0')
+      HOSTNAME = socket.gethostname()
+      START_TIME = time.time()
+
+      @app.route('/')
+      def home():
+          """Main service endpoint"""
+          return jsonify({
+              'service': SERVICE_NAME,
+              'version': SERVICE_VERSION,
+              'hostname': HOSTNAME,
+              'timestamp': datetime.now().isoformat(),
+              'uptime_seconds': round(time.time() - START_TIME, 2),
+              'message': 'VM Web Service is running in Istio mesh'
+          })
+
+      @app.route('/health')
+      def health():
+          """Health check endpoint"""
+          return jsonify({
+              'status': 'healthy',
+              'service': SERVICE_NAME,
+              'version': SERVICE_VERSION,
+              'hostname': HOSTNAME,
+              'timestamp': datetime.now().isoformat(),
+              'checks': {
+                  'service': 'ok',
+                  'uptime': round(time.time() - START_TIME, 2)
+              }
+          })
+
+      @app.route('/ready')
+      def ready():
+          """Readiness probe endpoint"""
+          return jsonify({
+              'status': 'ready',
+              'service': SERVICE_NAME,
+              'timestamp': datetime.now().isoformat()
+          })
+
+      @app.route('/info')
+      def info():
+          """Service information endpoint"""
+          return jsonify({
+              'service': SERVICE_NAME,
+              'version': SERVICE_VERSION,
+              'hostname': HOSTNAME,
+              'start_time': datetime.fromtimestamp(START_TIME).isoformat(),
+              'uptime_seconds': round(time.time() - START_TIME, 2),
+              'python_version': os.sys.version,
+              'environment': dict(os.environ)
+          })
+
+      @app.route('/metrics')
+      def metrics():
+          """Basic metrics endpoint"""
+          uptime = time.time() - START_TIME
+          metrics_text = f"""# HELP vm_service_uptime_seconds Service uptime in seconds
+      # TYPE vm_service_uptime_seconds gauge
+      vm_service_uptime_seconds {uptime}
+      
+      # HELP vm_service_requests_total Total number of requests
+      # TYPE vm_service_requests_total counter
+      vm_service_requests_total 1
+      
+      # HELP vm_service_info Service information
+      # TYPE vm_service_info gauge
+      vm_service_info{{service="{SERVICE_NAME}",version="{SERVICE_VERSION}",hostname="{HOSTNAME}"}} 1
+      """
+          return metrics_text
+
+      if __name__ == '__main__':
+          print(f"Starting {SERVICE_NAME} v{SERVICE_VERSION} on {HOSTNAME}")
+          app.run(host='0.0.0.0', port=8080, debug=False)
+
+  # Systemd service for the VM web application
+  - path: /etc/systemd/system/vm-web-service.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=VM Web Service for Istio Mesh Integration
+      Documentation=https://istio.io/latest/docs/setup/install/virtual-machine/
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=azureuser
+      Group=azureuser
+      WorkingDirectory=/home/azureuser/vm-service
+      ExecStart=/usr/bin/python3 /home/azureuser/vm-service/app.py
+      Restart=always
+      RestartSec=10
+      Environment=SERVICE_NAME=vm-web-service
+      Environment=SERVICE_VERSION=v1.0
+      Environment=FLASK_ENV=production
+      Environment=PYTHONPATH=/home/azureuser/.local/lib/python3.10/site-packages
+      KillMode=mixed
+      TimeoutStartSec=30
+      TimeoutStopSec=15
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Mesh setup completion script
+  - path: /home/azureuser/complete-mesh-setup.sh
+    permissions: '0755'
+    owner: azureuser:azureuser
+    content: |
+      #!/bin/bash
+      # Complete Istio mesh integration setup
+
+      set -euo pipefail
+
+      # Color codes
+      RED='\033[0;31m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[1;33m'
+      NC='\033[0m'
+
+      print_status() {
+          echo -e "${GREEN}[INFO]${NC} $1"
+      }
+
+      print_error() {
+          echo -e "${RED}[ERROR]${NC} $1"
+      }
+
+      print_warning() {
+          echo -e "${YELLOW}[WARNING]${NC} $1"
+      }
+
+      VM_FILES_DIR="/tmp/vm-files"
+
+      # Validate required files
+      print_status "Validating mesh configuration files..."
+      
+      if [ ! -d "$VM_FILES_DIR" ]; then
+          print_error "VM files directory not found at $VM_FILES_DIR"
+          print_error "Please ensure certificates and configuration files are transferred first"
+          exit 1
+      fi
+
+      required_files=("istio-token" "root-cert.pem" "cluster.env" "mesh.yaml" "hosts")
+      for file in "${required_files[@]}"; do
+          if [ ! -f "$VM_FILES_DIR/$file" ]; then
+              print_error "Required file not found: $file"
+              exit 1
+          fi
+          print_status "✓ Found required file: $file"
+      done
+
+      print_status "Installing Istio certificates and configuration..."
+
+      # Install certificates with proper permissions
+      sudo cp "$VM_FILES_DIR/root-cert.pem" /etc/certs/
+      sudo chmod 644 /etc/certs/root-cert.pem
+      sudo cp /etc/certs/root-cert.pem /var/run/secrets/istio/
+      print_status "✓ Root certificate installed"
+
+      # Install Istio token
+      sudo cp "$VM_FILES_DIR/istio-token" /var/run/secrets/tokens/istio-token
+      sudo chmod 644 /var/run/secrets/tokens/istio-token
+      print_status "✓ Istio token installed"
+
+      # Update hosts file (avoid duplicates)
+      if ! grep -q "istiod" /etc/hosts; then
+          sudo sh -c "cat $VM_FILES_DIR/hosts >> /etc/hosts"
+          print_status "✓ Hosts file updated"
+      else
+          print_status "✓ Hosts file already contains Istio entries"
+      fi
+
+      # Add VM hostname if not present
+      if ! grep -q "$(hostname)" /etc/hosts; then
+          sudo sh -c "echo '127.0.0.1 $(hostname)' >> /etc/hosts"
+          print_status "✓ VM hostname added to hosts file"
+      fi
+
+      # Install mesh configuration
+      sudo cp "$VM_FILES_DIR/mesh.yaml" /etc/istio/config/mesh
+      sudo chmod 644 /etc/istio/config/mesh
+      print_status "✓ Mesh configuration installed"
+
+      # Install cluster environment
+      sudo cp "$VM_FILES_DIR/cluster.env" /var/lib/istio/envoy/
+      sudo chmod 644 /var/lib/istio/envoy/cluster.env
+      print_status "✓ Cluster environment configuration installed"
+
+      # Set proper ownership for all Istio files
+      sudo chown -R istio-proxy:istio-proxy /etc/certs /var/run/secrets /var/lib/istio /etc/istio/proxy /etc/istio/config
+      print_status "✓ File permissions set"
+
+      # Start services
+      print_status "Starting VM web service..."
+      sudo systemctl start vm-web-service.service
+      sleep 3
+
+      print_status "Starting Istio service..."
+      sudo systemctl start istio.service
+      sleep 15
+
+      print_status "✓ Mesh setup completed successfully!"
+      print_status ""
+      print_status "🎉 VM is now integrated with the Istio mesh!"
+      print_status ""
+      print_status "Next steps:"
+      print_status "1. Verify integration: ./check-service.sh"
+      print_status "2. Check service status: ./service-status.sh"
+      print_status "3. View Istio admin interface: http://$(curl -s ifconfig.me):15000"
+
+  # Cleanup script for mesh files
+  - path: /home/azureuser/cleanup-mesh.sh
+    permissions: '0755'
+    owner: azureuser:azureuser
+    content: |
+      #!/bin/bash
+      # Cleanup mesh configuration (for testing/redeployment)
+
+      set -euo pipefail
+
+      echo "🧹 Cleaning up Istio mesh configuration..."
+
+      # Stop services
+      sudo systemctl stop istio.service 2>/dev/null || true
+      sudo systemctl stop vm-web-service.service 2>/dev/null || true
+
+      # Remove certificates and tokens
+      sudo rm -f /etc/certs/root-cert.pem
+      sudo rm -f /var/run/secrets/istio/root-cert.pem
+      sudo rm -f /var/run/secrets/tokens/istio-token
+      sudo rm -f /etc/istio/config/mesh
+      sudo rm -f /var/lib/istio/envoy/cluster.env
+
+      # Clean up hosts entries (preserve original)
+      sudo sed -i '/istiod/d' /etc/hosts || true
+
+      # Remove transferred files
+      sudo rm -rf /tmp/vm-files
+
+      echo "✓ Mesh configuration cleaned up"
+      echo "VM is ready for fresh mesh integration"
+
+# Power management
+power_state:
+  mode: reboot
+  delay: 5
+  message: "Rebooting after cloud-init setup completion"
+
+# Final messages and status
+final_message: |
+  🚀 Istio-ready VM CloudInit setup completed!
+  
+  VM Configuration Summary:
+  - ✅ Istio sidecar components installed
+  - ✅ VM web service configured
+  - ✅ Firewall rules configured for mesh traffic
+  - ✅ Health check and monitoring scripts ready
+  - ✅ Proper user permissions and directory structure
+  
+  To complete Istio mesh integration:
+  
+  1. Transfer mesh certificates and configuration:
+     scp -r vm-files/* azureuser@VM_IP:/tmp/vm-files/
+  
+  2. Complete mesh setup:
+     ssh azureuser@VM_IP './complete-mesh-setup.sh'
+  
+  3. Verify integration:
+     ssh azureuser@VM_IP './check-service.sh'
+  
+  4. Create WorkloadEntry in your cluster:
+     kubectl apply -f workload-entry.yaml
+  
+  📊 Service Endpoints:
+  - Health Check: http://VM_IP:8080/health
+  - Service Info: http://VM_IP:8080/info
+  - Istio Admin: http://VM_IP:15000
+  
+  📚 Log Locations:
+  - Cloud-init: /var/log/cloud-init-output.log
+  - Istio: journalctl -u istio.service
+  - VM Service: journalctl -u vm-web-service.service
+  
+  🔧 Troubleshooting Scripts:
+  - ./check-service.sh - Comprehensive health check
+  - ./service-status.sh - Detailed service status
+  - ./cleanup-mesh.sh - Reset mesh configuration
